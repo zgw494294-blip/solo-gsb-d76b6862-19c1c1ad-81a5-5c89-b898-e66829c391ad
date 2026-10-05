@@ -80,6 +80,20 @@
   失效引用中出现的全部身份号（恢复后继续拆分 / 复制不会复用旧身份）；
   非法快照（422）或写入失败（500）时旧存档一律保留。
 
+离线校订回传（``POST /api/proofread/preview`` / ``POST /api/proofread/commit``）：
+- 页面导出一份 ``编号|正文`` 校订文本（与整稿导出同一解析逻辑，导出当刻存在失效引用
+  时拒绝），并在页面内存保留**最近一次导出快照**（导出当刻的顺序与内部正文）；继续
+  改稿不清空快照，换稿（重新导入 / 恢复存档）或刷新才清空。
+- 回传文本只能改正文：行数、编号与行序必须与导出快照逐行一致（沿用单行正文校验）；
+  行中的 ``[[数字]]`` 按**导出时编号**绑定身份（快照顺序解释），不能按当前编号解释。
+- 预演只展示相对快照发生改动的行及其旧 / 新正文；提交时按**当前稿**再次核验，只处理
+  相对快照改动的行：当前正文须仍等于快照正文或已经等于回传正文，否则该行不可接纳。
+- 待改身份已删除、两边（离线 / 当前稿）把同一行改成不同正文、改动行回传正文的引用
+  目标在当前稿中已删除，或应用结果违反最新锁定保护时，**整份拒绝并列原因**（提交
+  409，结构化原因见 ``detail.conflicts`` / ``detail.locked``；预演在 200 响应中给出
+  同样的改动列表与拒绝原因，不改动任何草稿）。
+- 未改行、当前顺序、原稿基线与身份上界保持不变；取消或失败不改稿。
+
 条款锁定（``lock_ids``，随写稿请求提交）：
 - 锁定集合仅存调用方（页面）内存，不进存档快照、不改存档协议；由后端按**操作后的实际结果**
   核验，而不是只看操作对象是否在集合中。
@@ -243,6 +257,30 @@ class ArchiveSnapshotIn(BaseModel):
 class ArchivePutIn(BaseModel):
     version: int  # 最近读取或保存成功得到的版本；空槽为 0
     snapshot: ArchiveSnapshotIn
+
+
+class ProofreadIn(BaseModel):
+    # 离线校订回传：导出快照（导出当刻草稿）、当前稿、回传文本与本页锁定集合。
+    # 快照与当前稿均沿用现有草稿结构；正文为内部形态 [[c3]]。
+    # 当前稿与页面其他写稿接口一致放在顶层 order_ids / clauses（经写稿提交协调层
+    # 统一附上）；显式嵌套 current 也接受（如直接调用 HTTP API 的其他客户端）。
+    snapshot: StateIn
+    current: StateIn | None = None
+    order_ids: list[str] | None = None
+    clauses: list[ClauseIn] | None = None
+    text: str  # 离线校订后回传的“编号|正文”文本（引用按导出时编号书写）
+    lock_ids: list[str] | None = None  # 本页锁定集合；None 表示旧调用（按无锁定处理）
+
+    def current_state(self) -> StateIn:
+        """当前稿：优先嵌套 current，否则取顶层 order_ids / clauses。"""
+        if self.current is not None:
+            return self.current
+        if self.order_ids is not None and self.clauses is not None:
+            return StateIn(order_ids=self.order_ids, clauses=self.clauses)
+        raise HTTPException(
+            422,
+            detail={"errors": ["缺少当前稿：须提供 current，或顶层 order_ids / clauses"]},
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -1485,6 +1523,363 @@ def review_export(payload: ReviewIn):
             )
         raise HTTPException(409, detail={"errors": errors, "unreviewed": unreviewed})
     return {"text": "\n".join(lines)}
+
+
+# --------------------------------------------------------------------------- #
+# 离线校订回传（按导出时编号绑定身份；提交只接纳相对快照的改动行）
+# --------------------------------------------------------------------------- #
+def _parse_proofread_text(text: str, snap_by_id: dict[str, ClauseIn]) -> tuple[dict[str, str], list[str]]:
+    """解析离线校订回传文本，按**导出时编号**（快照顺序）绑定稳定身份。
+
+    回传文本只能改正文：行数、编号与行序必须与快照逐行一致，每行沿用单行正文
+    校验（非空、不跨行、引用写作 ``[[数字]]`` 且目标在导出编号范围内）。
+    返回 ``身份 -> 回传内部正文`` 与逐行格式错误（有错误时映射不可用）。
+    """
+    errors: list[str] = []
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.split("\n")
+    # 仅容忍粘贴时常见的结尾空行（与导入同一口径）；中间 / 开头空行仍拒收
+    while lines and lines[-1].strip() == "":
+        lines.pop()
+
+    n = len(lines)
+    if n != len(snap_by_id):
+        errors.append(
+            f"回传文本共 {n} 行，与导出快照的 {len(snap_by_id)} 行不一致"
+            "（离线校订只许改正文，行数、编号与行序必须保持不变）"
+        )
+
+    uploaded: dict[str, str] = {}
+    for i, line in enumerate(lines, 1):
+        if line.strip() == "":
+            errors.append(f"第 {i} 行为空行，整份文本须为连续的编号条款")
+            continue
+        if "|" not in line:
+            errors.append(f"第 {i} 行缺少分隔符“|”，格式须为“编号|正文”")
+            continue
+        head, body = line.split("|", 1)
+        head = head.strip()
+        if not head.isdigit() or head != str(i):
+            errors.append(
+                f"第 {i} 行编号“{head or '（空）'}”与导出行序不符"
+                f"（该行必须仍为编号 {i}：行数、编号与行序不可改动）"
+            )
+            continue
+        if body.strip() == "":
+            errors.append(f"第 {i} 行正文为空")
+        if "\n" in body:
+            errors.append(f"第 {i} 行不是单行条款")
+        refs, ref_errors = scan_raw_refs(body)
+        for err in ref_errors:
+            errors.append(f"第 {i} 行：{err}")
+        for ref in refs:
+            if not (1 <= ref <= n):
+                errors.append(
+                    f"第 {i} 行引用无目标：[[{ref}]]（引用按导出时编号绑定，有效编号为 1～{n}）"
+                )
+        if errors:
+            continue
+        clause_id = f"c{i}"  # 编号即快照行序；快照身份须恰为 c1..cn（下面统一校验）
+        internal = MARKER_RE.sub(
+            lambda m: f"[[c{int(m.group(1))}]]", body
+        )
+        uploaded[clause_id] = internal
+    return uploaded, errors
+
+
+def _proofread_plan(
+    snap_order: list[str],
+    snap_by_id: dict[str, ClauseIn],
+    cur_order: list[str],
+    cur_by_id: dict[str, ClauseIn],
+    uploaded: dict[str, str],
+) -> tuple[list[dict], list[dict]]:
+    """计算离线校订的改动行与整份拒绝原因（预演 / 提交共用，规则完全一致）。
+
+    只处理相对快照正文发生改动的行；当前正文等于快照正文（离线期间当前稿未动该行）
+    或已经等于回传正文（改动已在当前稿中）才可接纳。每个改动行检查：
+    待改身份仍在当前稿、当前稿未把该行改成另一个正文、回传正文的引用目标仍在当前稿。
+    返回 ``(changes, rejects)``；rejects 非空时调用方须整份拒绝。
+    """
+    snap_pos = {clause_id: i + 1 for i, clause_id in enumerate(snap_order)}
+    cur_pos = {clause_id: i + 1 for i, clause_id in enumerate(cur_order)}
+    changes: list[dict] = []
+    rejects: list[dict] = []
+
+    def reject(kind: str, clause_id: str, reasons: list[str]) -> None:
+        item = next((r for r in rejects if r["id"] == clause_id), None)
+        if item is None:
+            item = {
+                "id": clause_id,
+                "original": int(clause_id[1:]),
+                "export_no": snap_pos.get(clause_id),
+                "current_no": cur_pos.get(clause_id),
+                "kind": kind,
+                "reasons": [],
+            }
+            rejects.append(item)
+        for reason in reasons:
+            if reason not in item["reasons"]:
+                item["reasons"].append(reason)
+
+    for clause_id in snap_order:
+        new_body = uploaded[clause_id]
+        snap_body = snap_by_id[clause_id].body
+        if new_body == snap_body:
+            continue  # 未改行：不展示、不处理
+        cur_clause = cur_by_id.get(clause_id)
+        if cur_clause is None:
+            reject("missing", clause_id, ["待改身份在当前草稿中已删除，整份回传拒绝"])
+            changes.append(
+                {
+                    "id": clause_id,
+                    "original": int(clause_id[1:]),
+                    "export_no": snap_pos[clause_id],
+                    "current_no": None,
+                    "old_body": snap_body,
+                    "new_body": new_body,
+                }
+            )
+            continue
+        cur_body = cur_clause.body
+        if cur_body != snap_body and cur_body != new_body:
+            reject(
+                "conflict",
+                clause_id,
+                ["离线回传与当前草稿把该行改成了不同正文（两边各有校订），整份回传拒绝"],
+            )
+        # 改动行回传正文中的引用目标必须仍在当前稿（按导出时编号绑定的身份核验，
+        # 不按当前编号解释）；未改行不核验，其既有失效引用保持原样
+        for m in MARKER_RE.finditer(new_body):
+            target = m.group(1)
+            if target not in cur_by_id:
+                reject(
+                    "target_deleted",
+                    clause_id,
+                    [
+                        f"回传正文的引用 [[{target}]]（导出时第 {snap_pos.get(target, '?')} 条）"
+                        "目标在当前草稿中已删除，整份回传拒绝"
+                    ],
+                )
+        changes.append(
+            {
+                "id": clause_id,
+                "original": int(clause_id[1:]),
+                "export_no": snap_pos[clause_id],
+                "current_no": cur_pos[clause_id],
+                "old_body": snap_body,
+                "new_body": new_body,
+            }
+        )
+
+    def sort_key(item: dict) -> tuple[int, int]:
+        no = item["export_no"]
+        return (1, no) if no is not None else (2, item["original"])
+
+    rejects.sort(key=sort_key)
+    changes.sort(key=lambda c: c["export_no"])
+    return changes, rejects
+
+
+def _proofread_response_texts(
+    changes: list[dict],
+    snap_pos: dict[str, int],
+    cur_pos: dict[str, int],
+) -> None:
+    """为改动列表补上导出 / 当前编号形态的旧 / 新正文，便于页面与调用方核对。"""
+    for ch in changes:
+        ch["old_text"] = resolve_body(ch["old_body"], snap_pos)[0]
+        ch["new_text"] = resolve_body(ch["new_body"], cur_pos)[0]
+
+
+def _load_proofread(payload: ProofreadIn) -> tuple[
+    dict[str, ClauseIn], dict[str, ClauseIn], dict[str, str], list[str] | None, StateIn
+]:
+    """校验快照 / 当前稿 / 锁定集合并解析回传文本。
+
+    返回 ``(snap_by_id, cur_by_id, uploaded, lock_ids, current)``；
+    回传文本格式错误时直接 422。
+    """
+    current = payload.current_state()
+    snap_by_id = _validate_state(payload.snapshot.order_ids, payload.snapshot.clauses)
+    cur_by_id = _validate_state(current.order_ids, current.clauses)
+    lock_ids = _normalize_lock_ids(payload.lock_ids, cur_by_id)
+
+    # 快照必须恰为“编号 1..n 连续排列”的导出：回传按行序（编号）绑定身份，
+    # 只有 c1..cn 顺序排列的快照才能让“导出时编号”无歧义地对应身份
+    snap_errors: list[str] = []
+    expected = [f"c{i}" for i in range(1, len(payload.snapshot.order_ids) + 1)]
+    if payload.snapshot.order_ids != expected:
+        snap_errors.append(
+            "导出快照的编号不是从 1 连续排列（离线校订按导出时编号绑定身份，"
+            "请用页面「导出校订文本」生成的最近快照）"
+        )
+    # 导出当刻不得含失效引用：页面导出本身已拒绝，这里再兜底
+    for clause_id in payload.snapshot.order_ids:
+        for m in MARKER_RE.finditer(snap_by_id[clause_id].body):
+            if m.group(1) not in snap_by_id:
+                snap_errors.append(
+                    f"导出快照第 {payload.snapshot.order_ids.index(clause_id) + 1} 条"
+                    f"（{clause_id}）含失效引用 {m.group(0)}，含失效引用的文本不能导出校订"
+                )
+    if snap_errors:
+        raise HTTPException(422, detail={"errors": snap_errors})
+
+    uploaded, parse_errors = _parse_proofread_text(payload.text, snap_by_id)
+    if parse_errors:
+        raise HTTPException(422, detail={"errors": parse_errors})
+    return snap_by_id, cur_by_id, uploaded, lock_ids, current
+
+
+@app.post("/api/proofread/preview")
+def proofread_preview(payload: ProofreadIn):
+    """离线校订**预演**：只读，不改任何草稿。
+
+    返回相对快照改动的行（``changes``：旧 / 新内部正文与导出 / 当前编号形态文本）
+    与整份拒绝原因（``rejects``：待改身份删除 / 两边改成不同正文 / 改动行引用目标
+    删除 / 锁定保护，按导出行序列出）。回传文本格式错误（行数、编号、行序或单行
+    正文校验不过）返回 422。
+    """
+    snap_by_id, cur_by_id, uploaded, lock_ids, current = _load_proofread(payload)
+    changes, rejects = _proofread_plan(
+        payload.snapshot.order_ids,
+        snap_by_id,
+        current.order_ids,
+        cur_by_id,
+        uploaded,
+    )
+    snap_pos = {clause_id: i + 1 for i, clause_id in enumerate(payload.snapshot.order_ids)}
+    cur_pos = {clause_id: i + 1 for i, clause_id in enumerate(current.order_ids)}
+
+    # 锁定保护按应用后的结果核验（与提交同一构造，预演即给出最终结论）。
+    # 应用结果只由当前稿条款构成（缺失身份不在其中，锁定集合也不可能含它），始终可核验。
+    locked: list[dict] = []
+    if lock_ids is not None:
+        new_clauses, new_order = _apply_proofread(
+            current.order_ids, cur_by_id, snap_by_id, uploaded
+        )
+        new_by = {item["id"]: ClauseIn(**item) for item in new_clauses}
+        locked = _lock_violations(cur_by_id, new_order, new_by, lock_ids)
+    if locked:
+        rejects = _merge_lock_rejects(rejects, locked, snap_pos, cur_pos)
+
+    _proofread_response_texts(changes, snap_pos, cur_pos)
+    return {
+        "changes": changes,
+        "rejects": rejects,
+        "locked": locked,
+        "change_count": len(changes),
+        "has_rejections": bool(rejects),
+    }
+
+
+def _merge_lock_rejects(
+    rejects: list[dict], locked: list[dict], snap_pos: dict[str, int], cur_pos: dict[str, int]
+) -> list[dict]:
+    """把锁定违例并入结构化拒绝原因（kind=locked），仍按导出行序排列。"""
+    by_id = {r["id"]: r for r in rejects}
+    for v in locked:
+        item = by_id.get(v["id"])
+        if item is None:
+            item = {
+                "id": v["id"],
+                "original": v["original"],
+                "export_no": snap_pos.get(v["id"]),
+                "current_no": cur_pos.get(v["id"]),
+                "kind": "locked",
+                "reasons": [],
+            }
+            rejects.append(item)
+            by_id[v["id"]] = item
+        else:
+            item["kind"] = "locked" if item["kind"] not in ("missing", "conflict") else item["kind"]
+        for reason in v["reasons"]:
+            if reason not in item["reasons"]:
+                item["reasons"].append(reason)
+
+    def sort_key(item: dict) -> tuple[int, int]:
+        no = item["export_no"]
+        return (1, no) if no is not None else (2, item["original"])
+
+    rejects.sort(key=sort_key)
+    return rejects
+
+
+def _apply_proofread(
+    cur_order: list[str],
+    cur_by_id: dict[str, ClauseIn],
+    snap_by_id: dict[str, ClauseIn],
+    uploaded: dict[str, str],
+) -> tuple[list[dict], list[str]]:
+    """构造应用结果：只替换相对快照改动、且当前稿仍可接纳的行；顺序与身份集合不变。"""
+    new_clauses: list[dict] = []
+    new_order: list[str] = []
+    for clause_id in cur_order:
+        body = cur_by_id[clause_id].body
+        snap_clause = snap_by_id.get(clause_id)
+        if snap_clause is not None:
+            new_body = uploaded.get(clause_id)
+            if new_body is not None and new_body != snap_clause.body:
+                # 当前正文等于快照（直接采用回传值）或已等于回传值（保持）；
+                # 其余冲突情形由调用方在核验阶段整份拒绝，不会走到这里
+                if body == snap_clause.body:
+                    body = new_body
+        new_clauses.append({"id": clause_id, "body": body})
+        new_order.append(clause_id)
+    return new_clauses, new_order
+
+
+@app.post("/api/proofread/commit")
+def proofread_commit(payload: ProofreadIn):
+    """离线校订**提交**：按当前稿核验后只接纳相对快照改动的行。
+
+    当前正文须仍等于快照正文或已经等于回传正文；待改身份删除、两边改成不同正文、
+    改动行引用目标删除或违反最新锁定保护时整份拒绝（409，``detail.conflicts`` 与
+    ``detail.locked`` 结构化列出原因），草稿、顺序、基线与身份上界均不变。
+    回传文本格式错误（422）同样不改稿。成功返回应用后的整份当前稿。
+    """
+    snap_by_id, cur_by_id, uploaded, lock_ids, current = _load_proofread(payload)
+    changes, rejects = _proofread_plan(
+        payload.snapshot.order_ids,
+        snap_by_id,
+        current.order_ids,
+        cur_by_id,
+        uploaded,
+    )
+    new_clauses, new_order = _apply_proofread(
+        current.order_ids, cur_by_id, snap_by_id, uploaded
+    )
+
+    # 锁定核验按应用后的实际结果（只有改动行正文可能变化，顺序与身份集合不变）
+    locked: list[dict] = []
+    if lock_ids is not None:
+        new_by = {item["id"]: ClauseIn(**item) for item in new_clauses}
+        locked = _lock_violations(cur_by_id, new_order, new_by, lock_ids)
+
+    snap_pos = {clause_id: i + 1 for i, clause_id in enumerate(payload.snapshot.order_ids)}
+    cur_pos = {clause_id: i + 1 for i, clause_id in enumerate(current.order_ids)}
+    if locked:
+        rejects = _merge_lock_rejects(rejects, locked, snap_pos, cur_pos)
+    if rejects:
+        errors = ["离线校订与当前草稿冲突，整份拒绝，原因如下："]
+        for r in rejects:
+            where = (
+                f"导出第 {r['export_no']} 条"
+                if r["export_no"] is not None
+                else f"原第 {r['original']} 条"
+            )
+            for reason in r["reasons"]:
+                errors.append(f"{where}（稳定身份 {r['id']}）：{reason}")
+        raise HTTPException(
+            409,
+            detail={
+                "errors": errors,
+                "conflicts": [r for r in rejects if r["kind"] != "locked"],
+                "locked": locked,
+            },
+        )
+
+    return {"order_ids": new_order, "clauses": new_clauses, "applied": len(changes)}
 
 
 # --------------------------------------------------------------------------- #

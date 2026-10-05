@@ -55,6 +55,16 @@ const state = {
   archiveNotice: null, // 存档提示（如"已读取最新版本 v3"、"服务端暂无存档"）
   lockIds: [], // 条款锁定集合（稳定身份）：仅存本页内存，随写稿请求提交、由后端按实际结果核验；
   // 换稿（重新导入 / 恢复存档）或刷新清空，不进存档快照；锁定切换不改草稿、不推进修订号、不改复核
+  proofreadOpen: false, // 离线校订面板是否展开
+  proofreadSnapshot: null, // 最近一次导出校订文本的快照（{ order_ids, clauses }，深拷贝，内部形态）；
+  // 导出后继续改稿不清空；换稿（重新导入 / 恢复存档）或刷新才清空
+  proofreadExportText: "", // 最近一次导出的“编号|正文”文本（展示 / 下载用）
+  proofreadUpload: "", // 回传文本框内容（面板内编辑态；取消预演清空，导出新快照时清空）
+  proofreadData: null, // 最近一次与“当前快照 + 当前回传文本”一致的 /api/proofread/preview 响应
+  proofreadError: null, // 最近一次预演 / 提交失败的错误信息（数组）；重新预演或成功后清空
+  proofreadPreviewing: false, // /api/proofread/preview 在途
+  proofreadExporting: false, // 导出校订文本（/api/export）在途
+  proofreadCommitting: false, // /api/proofread/commit 在途（写稿互斥）
 };
 
 const MAX_CLAUSES = 40; // 与后端 MAX_LINES 一致：拆分后总数不能超过它
@@ -71,6 +81,7 @@ let refsInFlight = false; // 是否已有 /api/referrers 在途：防止重复�
 let excerptSeq = 0; // 摘录请求序号：改稿 / 切换勾选 / 重新导入 / 新请求都会推进，迟到响应一律丢弃
 let reviewExportSeq = 0; // 复核稿下载序号：重新导入 / 恢复存档 / 新下载都会推进，
 // 旧下载的响应与收尾一律失效——不得保存旧文件、弹提示或影响新下载
+let proofreadSeq = 0; // 离线校订预演序号：重新预演 / 改稿 / 换稿都会推进，迟到响应一律丢弃
 
 const MARKER = /\[\[(?:原(\d+)\?|(\d+))\]\]/g; // 预览文本中的引用形态
 
@@ -98,6 +109,11 @@ const excerptPanel = $("#excerpt-panel");
 const excerptStatus = $("#excerpt-status");
 const excerptBanner = $("#excerpt-banner");
 const excerptBody = $("#excerpt-body");
+const proofreadBtn = $("#proofread-btn");
+const proofreadPanel = $("#proofread-panel");
+const proofreadStatus = $("#proofread-status");
+const proofreadBanner = $("#proofread-banner");
+const proofreadBody = $("#proofread-body");
 const reviewPanel = $("#review-panel");
 const reviewStatus = $("#review-status");
 const reviewBody = $("#review-body");
@@ -406,12 +422,18 @@ function touch() {
   state.refsError = null;
   // 勾选条款摘录同理：改稿立即清空旧结果与提示，在途请求的迟到响应一律丢弃
   clearExcerpt();
+  // 离线校订：最近导出快照保留（继续改稿不清空它），但回传预演结果立即失效
+  // （提交时须按改稿后的当前稿重新核验），迟到响应不得恢复旧预演
+  if (state.proofreadData || state.proofreadError || state.proofreadPreviewing) {
+    clearProofreadDryRun();
+  }
   // 每次改稿成功后核对复核记录：记录中的正文或目标存续有变化的，该条复核立即清除；
   // 纯重排、编号平移与无关改动保留复核；清除后改回旧文也不自动恢复
   pruneReviews();
   syncToolbar();
   syncDiffPanel();
   syncReferrers();
+  syncProofreadPanel();
   if (state.diffOpen) refreshDiff();
   if (state.refsId) refreshReferrers(); // 面板展开时按最新已保存草稿重新查询
 }
@@ -420,10 +442,12 @@ function syncToolbar() {
   updateMergeBtn();
   updateDuplicateBtn();
   updateExcerptBtn();
+  updateProofreadBtn();
   updateDownloadBtn();
   syncArchiveUi();
   syncReviewPanel();
   syncMergePanel();
+  syncProofreadPanel();
   syncBusy();
 }
 
@@ -552,6 +576,28 @@ function updateExcerptBtn() {
     state.pickIds.length < 1
       ? "勾选一条或多条条款后可导出摘录"
       : "把勾选条款及其直接、间接引用的全部现存条款导出为独立编号的摘录";
+}
+
+// 离线校订入口：与其他只读导出同一门禁——未保存编辑 / 拆分选择 / 写稿在途 /
+// 预览未追上当前草稿时不可用（失效引用不直接禁用：导出请求会被服务端拒绝并在面板列原因）。
+function updateProofreadBtn() {
+  if (state.proofreadCommitting) {
+    proofreadBtn.disabled = true;
+    proofreadBtn.textContent = "提交中…";
+    return;
+  }
+  proofreadBtn.disabled =
+    state.editingId !== null ||
+    state.splittingId !== null ||
+    state.writing !== null ||
+    state.proofreadPreviewing ||
+    !state.previewFresh;
+  // 标签的展开 / 收起语义在此统一管理（syncProofreadPanel 不再改按钮文字，
+  // 以免覆盖忙碌态）
+  proofreadBtn.textContent = state.proofreadOpen ? "收起离线校订" : "离线校订";
+  proofreadBtn.title = proofreadBtn.disabled
+    ? "未保存编辑、拆分选择或写稿未结束、预览未同步时不可操作"
+    : "导出“编号|正文”校订文本，线下只改正文后回传接回当前草稿";
 }
 
 // --------------------------------------------------------------------------- //
@@ -828,6 +874,11 @@ function installArchive(snap, version) {
   reviewExportSeq += 1;
   // 合并撤销记录仅存本页内存：成功恢复存档即清空（已清除记录不恢复）
   state.mergeRecords = [];
+  // 离线校订：恢复存档属换稿——导出快照、回传文本与预演全部清空，旧响应不得影响新稿
+  resetProofreadForNewDraft();
+  state.proofreadOpen = false;
+  proofreadPanel.hidden = true;
+  proofreadBtn.textContent = "离线校订";
   state.preview = null;
   state.previewError = null;
   state.renderedRev = null;
@@ -924,6 +975,11 @@ importBtn.addEventListener("click", async () => {
     state.reviewExporting = false;
     // 合并撤销记录仅存本页内存：换稿即清空（不进存档快照）
     state.mergeRecords = [];
+    // 离线校订：换稿即清空导出快照、回传与预演（快照不进存档，仅存本页内存）
+    resetProofreadForNewDraft();
+    state.proofreadOpen = false;
+    proofreadPanel.hidden = true;
+    proofreadBtn.textContent = "离线校订";
     // 新草稿的存档交互重新开始：保留服务端版本知识（仍有效），清掉旧提示；
     // touch() 会把新稿标记为未存档
     state.archiveError = null;
@@ -1003,6 +1059,11 @@ $("#reimport-btn").addEventListener("click", () => {
   reviewExportSeq += 1;
   // 合并撤销记录仅存本页内存：重新导入即清空
   state.mergeRecords = [];
+  // 离线校订：重新导入属换稿——快照、回传、预演与面板状态全部清空
+  resetProofreadForNewDraft();
+  state.proofreadOpen = false;
+  proofreadPanel.hidden = true;
+  proofreadBtn.textContent = "离线校订";
   previewInFlight = false; // 上一草稿在途预览的收尾将因世代不符而直接返回，这里复位在途态
   desk.hidden = true;
   importPanel.hidden = false;
@@ -2471,6 +2532,333 @@ excerptPanel.addEventListener("click", (ev) => {
     a.download = `excerpt-${stamp}.txt`;
     a.click();
     URL.revokeObjectURL(url);
+  }
+});
+
+// --------------------------------------------------------------------------- //
+// 离线校订（导出“编号|正文”校订文本 → 线下只改正文 → 回传接回当前草稿）
+// --------------------------------------------------------------------------- //
+// 生命周期：最近一次导出快照（proofreadSnapshot）只在**换稿**（重新导入 / 恢复存档）
+// 或刷新时清空；导出后继续在页面上改稿不清空它。回传预演结果（proofreadData）则与
+// 其他只读结果一致：改稿立即失效、迟到响应丢弃。提交经写稿提交协调层（互斥、携带
+// 最新 lock_ids、成功回包按最新集合核验），成功后只改正文，顺序、基线、身份上界不变，
+// 复核按 touch() 的既有规则清理；预览失败保留提交稿、仅重试预览。
+const PROOFREAD_REJECT_LABELS = {
+  missing: "待改身份已删除",
+  conflict: "两边改成不同正文",
+  target_deleted: "改动行引用目标已删除",
+  locked: "违反最新锁定保护",
+};
+
+function clearProofreadDryRun() {
+  state.proofreadData = null;
+  state.proofreadError = null;
+  state.proofreadPreviewing = false;
+  proofreadSeq += 1;
+}
+
+// 换稿（重新导入 / 恢复存档）：导出快照与全部离线校订状态一并清空，旧响应不得影响新稿
+function resetProofreadForNewDraft() {
+  state.proofreadSnapshot = null;
+  state.proofreadExportText = "";
+  state.proofreadUpload = "";
+  state.proofreadCommitting = false;
+  clearProofreadDryRun();
+}
+
+function proofreadChangeHtml(ch) {
+  return `
+    <li class="proofread-row" data-proofread-id="${esc(ch.id)}">
+      <div class="diff-row-head">
+        <span class="diff-nums">
+          导出第 ${ch.export_no} 条 → 当前第 ${
+            ch.current_no === null || ch.current_no === undefined ? "—（身份已删除）" : ch.current_no
+          }
+          <span class="diff-id">（稳定身份 ${esc(ch.id)}，原第 ${ch.original} 条）</span>
+        </span>
+      </div>
+      <div class="diff-bodies">
+        <div class="diff-col"><span class="diff-col-label">导出正文</span>
+          <div class="diff-text">${diffTextHtml(ch.old_text || "")}</div></div>
+        <div class="diff-col"><span class="diff-col-label">回传正文</span>
+          <div class="diff-text">${diffTextHtml(ch.new_text || "")}</div></div>
+      </div>
+    </li>`;
+}
+
+function proofreadRejectHtml(r) {
+  const label = PROOFREAD_REJECT_LABELS[r.kind] || r.kind;
+  return `
+    <li class="proofread-reject">
+      <span class="diff-tag tag-del">${label}</span>
+      <span class="diff-nums">导出第 ${r.export_no === null || r.export_no === undefined ? "—" : r.export_no} 条
+        <span class="diff-id">（稳定身份 ${esc(r.id)}，原第 ${r.original} 条）</span>
+      </span>
+      <ul>${r.reasons.map((m) => `<li>${esc(m)}</li>`).join("")}</ul>
+    </li>`;
+}
+
+function syncProofreadPanel() {
+  if (!state.proofreadOpen) return;
+  proofreadPanel.hidden = false;
+
+  // 重新渲染会替换面板 innerHTML：先留住用户在回传框中未提交的输入，渲染后还原
+  // （预演等待态切换 / 工具栏同步可能在用户输入后触发重渲染，不能因此清空回传文本）
+  const liveBox = proofreadBody.querySelector('[data-role="proofread-upload"]');
+  if (liveBox && typeof liveBox.value === "string" && liveBox.value !== "") {
+    state.proofreadUpload = liveBox.value;
+  }
+
+  // 顶部状态
+  const parts = [];
+  if (state.proofreadSnapshot) {
+    const n = state.proofreadSnapshot.order_ids.length;
+    parts.push(`已保留导出快照（${n} 条；继续改稿不清空，换稿 / 恢复存档 / 刷新清空）`);
+  } else {
+    parts.push("尚未导出校订文本");
+  }
+  proofreadStatus.textContent = parts.join("　");
+
+  // 横幅：预演 / 提交的格式错误与网络错误（整份拒绝原因在下方结构化列出，不走横幅）
+  if (state.proofreadError) {
+    proofreadBanner.hidden = false;
+    proofreadBanner.innerHTML =
+      `<strong>离线校订请求失败，草稿未改动。</strong>` +
+      `<ul>${state.proofreadError.map((m) => `<li>${esc(m)}</li>`).join("")}</ul>`;
+  } else {
+    proofreadBanner.hidden = true;
+    proofreadBanner.textContent = "";
+  }
+
+  const busy =
+    state.editingId !== null ||
+    state.splittingId !== null ||
+    state.writing !== null ||
+    !state.previewFresh;
+
+  // ---- 导出区 ------------------------------------------------------------- //
+  const exportSection = `
+    <div class="proofread-export">
+      <div class="excerpt-actions">
+        <button type="button" class="primary" data-action="proofread-export"${
+          busy || state.proofreadPreviewing ? " disabled" : ""
+        }>${state.proofreadExporting ? "导出中…" : "导出校订文本"}</button>
+        <button type="button" data-action="proofread-download"${
+          state.proofreadSnapshot && !busy ? "" : " disabled"
+        }>下载导出文本</button>
+      </div>
+      <pre class="preview proofread-text">${
+        state.proofreadExportText ? esc(state.proofreadExportText) : "（尚未导出）"
+      }</pre>
+    </div>`;
+
+  // ---- 回传区 ------------------------------------------------------------- //
+  let uploadSection;
+  if (!state.proofreadSnapshot) {
+    uploadSection = `<p class="hint">请先点「导出校订文本」生成快照与文本，再进行离线校订与回传。</p>`;
+  } else {
+    const previewing = state.proofreadPreviewing;
+    const data = state.proofreadData;
+    const rejected = !!(data && data.has_rejections);
+    const changeCount = data ? data.change_count : 0;
+    let resultHtml = "";
+    if (state.proofreadError) {
+      resultHtml = ""; // 错误已在横幅列出
+    } else if (previewing) {
+      resultHtml = `<p class="refs-loading">正在按当前草稿预演…</p>`;
+    } else if (data) {
+      const rejectHtml = data.rejects && data.rejects.length
+        ? `<h3 class="diff-subhead">整份拒绝原因（${data.rejects.length}）</h3>
+           <ul class="proofread-reject-list">${data.rejects.map(proofreadRejectHtml).join("")}</ul>`
+        : "";
+      const changeHtml = data.changes.length
+        ? `<h3 class="diff-subhead">将接纳的改动（${data.changes.length} 行，先展示后确认）</h3>
+           <ul class="diff-list">${data.changes.map(proofreadChangeHtml).join("")}</ul>`
+        : `<p class="diff-empty">回传正文与导出快照完全一致，没有需要接纳的改动。</p>`;
+      resultHtml = rejectHtml + changeHtml;
+    }
+    uploadSection = `
+      <div class="proofread-upload">
+        <p class="hint">把线下校订后的整份文本粘贴到下面（<b>行数、编号、行序不变，只改正文</b>；
+          引用按<b>导出时编号</b>书写），点「预演改动」先查看差异与拒绝原因：</p>
+        <textarea class="proofread-upload-text" rows="10" data-role="proofread-upload"
+          placeholder="粘贴整份“编号|正文”文本…">${esc(state.proofreadUpload)}</textarea>
+        <div class="excerpt-actions">
+          <button type="button" class="primary" data-action="proofread-preview"${
+            busy || previewing ? " disabled" : ""
+          }>${previewing ? "预演中…" : "预演改动"}</button>
+          <button type="button" data-action="proofread-commit"${
+            busy || previewing || !data || rejected || changeCount === 0 ? " disabled" : ""
+          }${
+            !data || rejected || changeCount === 0
+              ? ' title="预演通过且存在可接纳改动时才能提交"'
+              : ""
+          }>${state.proofreadCommitting ? "提交中…" : "确认提交改动"}</button>
+          <button type="button" data-action="proofread-cancel"${
+            busy || state.proofreadCommitting ? " disabled" : ""
+          }>取消（清空回传，不改稿）</button>
+        </div>
+        ${resultHtml}
+      </div>`;
+  }
+
+  proofreadBody.innerHTML = exportSection + uploadSection;
+}
+
+// 导出校订文本：复用 /api/export 的同一套解析（存在失效引用时服务端 409 拒绝）。
+// 成功后保留最近一次导出快照（深拷贝当前稿）与文本；继续改稿不清空，旧回传 / 预演清空。
+proofreadBtn.addEventListener("click", () => {
+  state.proofreadOpen = !state.proofreadOpen;
+  proofreadPanel.hidden = !state.proofreadOpen;
+  updateProofreadBtn();
+  if (state.proofreadOpen) syncProofreadPanel();
+});
+
+async function exportProofread() {
+  if (state.proofreadExporting) return;
+  if (state.editingId || state.splittingId || state.writing || !state.previewFresh) return;
+  // 导出归属只按草稿世代（epoch）：导出后继续改稿不清空快照，因此等待期间同稿的
+  // 修订号变化不作废导出；只有换稿（重新导入 / 恢复存档推进世代）才丢弃旧结果
+  const epoch = state.epoch;
+  state.proofreadExporting = true;
+  syncProofreadPanel();
+  updateProofreadBtn();
+  try {
+    const data = await api("/api/export", snapshot());
+    if (epoch !== state.epoch) return; // 等待期间已换稿：旧导出作废
+    if (!data || typeof data.text !== "string") {
+      state.proofreadError = ["导出响应正文不完整，请重试。"];
+      return;
+    }
+    // 保留最近一次导出快照：深拷贝，此后继续改稿不影响快照内容
+    state.proofreadSnapshot = snapshot();
+    state.proofreadExportText = data.text;
+    state.proofreadUpload = data.text; // 回传框默认填入导出原文，便于在其基础上改
+    state.proofreadError = null;
+    clearProofreadDryRun();
+  } catch (e) {
+    if (epoch !== state.epoch) return;
+    state.proofreadError = errorList(e);
+  } finally {
+    if (epoch === state.epoch) {
+      state.proofreadExporting = false;
+      syncProofreadPanel();
+      updateProofreadBtn();
+    }
+  }
+}
+
+// 预演：只读展示改动与整份拒绝原因，不改动草稿。回传文本、快照与当前稿一并提交；
+// 只采用最后一次发出、且仍对应当前草稿、当前快照与当前回传文本的响应。
+async function previewProofread() {
+  if (!state.proofreadSnapshot) return;
+  if (state.editingId || state.splittingId || state.writing || !state.previewFresh) return;
+  const textarea = proofreadBody.querySelector('[data-role="proofread-upload"]');
+  const text = textarea ? textarea.value : state.proofreadUpload;
+  state.proofreadUpload = text;
+  // 新预演取代旧预演：序号推进使旧响应作废；在途标记由本次（最新者）接管，
+  // 旧预演的迟到响应 / 收尾不再触碰状态（与对照、摘录面板同一归属规则）
+  const token = ++proofreadSeq;
+  const epoch = state.epoch;
+  const rev = state.rev;
+  state.proofreadPreviewing = true;
+  state.proofreadError = null;
+  syncProofreadPanel();
+  updateProofreadBtn();
+  let data;
+  try {
+    data = await api("/api/proofread/preview", {
+      snapshot: state.proofreadSnapshot,
+      current: snapshot(),
+      text,
+    });
+  } catch (e) {
+    if (token !== proofreadSeq || epoch !== state.epoch || rev !== state.rev) return;
+    state.proofreadPreviewing = false;
+    state.proofreadError = errorList(e);
+    syncProofreadPanel();
+    updateProofreadBtn();
+    return;
+  }
+  if (token !== proofreadSeq || epoch !== state.epoch || rev !== state.rev) return;
+  state.proofreadPreviewing = false;
+  if (
+    !data ||
+    !Array.isArray(data.changes) ||
+    !Array.isArray(data.rejects) ||
+    typeof data.has_rejections !== "boolean"
+  ) {
+    state.proofreadError = ["预演响应正文不完整，请重试。"];
+  } else {
+    state.proofreadData = data;
+  }
+  syncProofreadPanel();
+  updateProofreadBtn();
+}
+
+// 提交：复用写稿提交协调层（互斥 / 请求归属 / 锁定提交与回包核验 / 成功写回 / 收尾）。
+// 草稿、顺序与身份上界只在服务端成功且本地锁定核验通过后一起写回——离线校订不改顺序、
+// 不推进身份上界；复核由 touch() 按既有规则清理。成功后清空本次回传预演，快照保留，
+// 随后刷新预览；预览失败保留提交稿、仅重试预览。
+async function commitProofread() {
+  if (!state.proofreadSnapshot || !state.proofreadData) return;
+  if (state.proofreadData.has_rejections || state.proofreadData.change_count === 0) return;
+  if (state.editingId || state.splittingId || state.writing || !state.previewFresh) return;
+  const textarea = proofreadBody.querySelector('[data-role="proofread-upload"]');
+  const text = textarea ? textarea.value : state.proofreadUpload;
+  state.proofreadUpload = text;
+  const snapshotAtSubmit = state.proofreadSnapshot;
+  state.proofreadCommitting = true;
+  syncProofreadPanel();
+  updateProofreadBtn();
+  await submitWrite({
+    kind: "proofread-commit",
+    path: "/api/proofread/commit",
+    params: { snapshot: snapshotAtSubmit, text },
+    onSuccess: () => {
+      // 成功接回：清空本次预演结果（快照保留，可再次离线校订），回传文本保留为
+      // 已应用内容（用户可在其基础上继续改）；committing 复位，面板随 touch() 刷新
+      state.proofreadCommitting = false;
+      clearProofreadDryRun();
+    },
+    onError: (errors) => {
+      // 整份拒绝（409 冲突 / 锁定）或网络失败：草稿不变，原因显示在面板横幅；
+      // state.writing 已由协调层复位。旧预演已不再权威（当前稿或回传须调整），
+      // 作废它并要求重新预演后才能再次提交；回传文本保留供修正
+      state.proofreadCommitting = false;
+      state.proofreadError = errors;
+      state.proofreadData = null;
+      proofreadSeq += 1;
+    },
+  });
+}
+
+// 面板内全部按钮的事件委托（导出 / 下载 / 预演 / 提交 / 取消）
+proofreadPanel.addEventListener("click", (ev) => {
+  const btn = ev.target.closest("[data-action]");
+  if (!btn) return;
+  const action = btn.dataset.action;
+  if (action === "proofread-export") {
+    exportProofread();
+  } else if (action === "proofread-download") {
+    if (!state.proofreadExportText) return;
+    const blob = new Blob([state.proofreadExportText], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, "-");
+    a.href = url;
+    a.download = `proofread-${stamp}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+  } else if (action === "proofread-preview") {
+    previewProofread();
+  } else if (action === "proofread-commit") {
+    commitProofread();
+  } else if (action === "proofread-cancel") {
+    // 取消只清回本页回传 / 预演状态，不发写稿请求、不动草稿；导出快照保留
+    state.proofreadUpload = state.proofreadExportText;
+    clearProofreadDryRun();
+    syncProofreadPanel();
   }
 });
 

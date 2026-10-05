@@ -2236,3 +2236,387 @@ def test_merge_undo_does_not_revive_broken_refs_and_keeps_other_bodies():
     preview = r.json()
     c2 = next(it for it in preview["items"] if it["id"] == "c2")
     assert any(b["ref_id"] == "c9" for b in c2["broken"])
+
+
+# --------------------------------------------------------------------------- #
+# 离线校订回传（/api/proofread/preview 预演、/api/proofread/commit 提交）
+# --------------------------------------------------------------------------- #
+def _proof_doc(*bodies):
+    return {
+        "order_ids": [f"c{i + 1}" for i in range(len(bodies))],
+        "clauses": [{"id": f"c{i + 1}", "body": b} for i, b in enumerate(bodies)],
+    }
+
+
+PROOF_BASE = _proof_doc(
+    "甲方在七日内交付设备",
+    "乙方按 [[c1]] 验收后付款",
+    "争议解决见 [[c2]]",
+    "争议提交仲裁",
+)
+
+
+def _proof_text(*lines):
+    return "\n".join(lines)
+
+
+def test_proofread_preview_lists_only_changed_lines_with_old_and_new_text():
+    text = _proof_text(
+        "1|甲方在七日内交付设备",
+        "2|乙方改为三十日付款",
+        "3|争议解决见 [[2]]",
+        "4|争议提交仲裁",
+    )
+    r = client.post(
+        "/api/proofread/preview",
+        json={"snapshot": PROOF_BASE, "current": PROOF_BASE, "text": text},
+    )
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["change_count"] == 1
+    assert d["has_rejections"] is False
+    ch = d["changes"][0]
+    assert ch["id"] == "c2"
+    assert (ch["export_no"], ch["current_no"], ch["original"]) == (2, 2, 2)
+    assert ch["old_body"] == "乙方按 [[c1]] 验收后付款"
+    assert ch["new_body"] == "乙方改为三十日付款"
+    assert ch["old_text"] == "乙方按 [[1]] 验收后付款"
+    assert ch["new_text"] == "乙方改为三十日付款"
+
+
+def test_proofread_commit_applies_only_changed_bodies_keeps_order_and_ref_bindings():
+    text = _proof_text(
+        "1|甲方在七日内交付设备",
+        "2|乙方改为三十日付款",
+        "3|争议解决见 [[2]]",
+        "4|争议提交仲裁委员会",
+    )
+    r = client.post(
+        "/api/proofread/commit",
+        json={"snapshot": PROOF_BASE, "current": PROOF_BASE, "text": text},
+    )
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["applied"] == 2
+    # 顺序与身份集合不变，只有改动行正文变化
+    assert d["order_ids"] == ["c1", "c2", "c3", "c4"]
+    by_id = {c["id"]: c["body"] for c in d["clauses"]}
+    assert by_id["c1"] == "甲方在七日内交付设备"
+    assert by_id["c2"] == "乙方改为三十日付款"
+    assert by_id["c3"] == "争议解决见 [[c2]]"
+    assert by_id["c4"] == "争议提交仲裁委员会"
+
+
+def test_proofread_binds_refs_by_export_numbering_not_current_numbering():
+    # 当前稿已重排：c3,c1,c2,c4 —— 回传文本里的 [[1]] 仍须按导出编号绑定 c1
+    current = {
+        "order_ids": ["c3", "c1", "c2", "c4"],
+        "clauses": [dict(c) for c in PROOF_BASE["clauses"]],
+    }
+    text = _proof_text(
+        "1|甲方见 [[3]] 处理",  # 导出第 1 条 c1 改引导出第 3 条 c3
+        "2|乙方按 [[1]] 验收后付款",
+        "3|争议解决见 [[2]]",
+        "4|争议提交仲裁",
+    )
+    r = client.post(
+        "/api/proofread/commit",
+        json={"snapshot": PROOF_BASE, "current": current, "text": text},
+    )
+    assert r.status_code == 200, r.text
+    by_id = {c["id"]: c["body"] for c in r.json()["clauses"]}
+    assert by_id["c1"] == "甲方见 [[c3]] 处理"
+    # 当前顺序保持不变（按结果顺序返回）
+    assert r.json()["order_ids"] == ["c3", "c1", "c2", "c4"]
+
+
+def test_proofread_rejects_line_count_numbering_and_order_changes():
+    bad_texts = [
+        _proof_text("1|甲方在七日内交付设备", "2|乙方按 [[1]] 验收后付款"),  # 少行
+        "1|甲\n2|乙\n3|丙\n4|丁\n5|戊",  # 多行
+        _proof_text("1|甲", "3|乙", "2|丙", "4|丁"),  # 行序 / 编号被改动
+        _proof_text("甲|无编号", "2|乙", "3|丙", "4|丁"),
+        _proof_text("1|", "2|乙", "3|丙", "4|丁"),  # 空正文
+        "1|甲\n2|乙\n3|丙",  # 行数不足（正文只能单行，少行即拒收）
+        _proof_text("1|甲 [[9]]", "2|乙", "3|丙", "4|丁"),  # 引用超出导出行数
+        _proof_text("1|甲 [[ 1 ]]", "2|乙", "3|丙", "4|丁"),  # 引用格式错误
+        _proof_text("1|甲 [[1]] 多余 ]]", "2|乙", "3|丙", "4|丁"),  # 多余 ]]
+    ]
+    for text in bad_texts:
+        rv = client.post(
+            "/api/proofread/preview",
+            json={"snapshot": PROOF_BASE, "current": PROOF_BASE, "text": text},
+        )
+        assert rv.status_code == 422, text
+        assert rv.json()["detail"]["errors"]
+        # 格式错误同样拒绝提交
+        rc = client.post(
+            "/api/proofread/commit",
+            json={"snapshot": PROOF_BASE, "current": PROOF_BASE, "text": text},
+        )
+        assert rc.status_code == 422
+
+
+def test_proofread_upload_may_keep_pipe_characters_in_body():
+    doc = _proof_doc("正文里|可以有竖线", "乙方按 [[c1]] 验收")
+    text = _proof_text("1|正文里|可以再|加竖线", "2|乙方按 [[1]] 验收")
+    r = client.post(
+        "/api/proofread/commit", json={"snapshot": doc, "current": doc, "text": text}
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["clauses"][0]["body"] == "正文里|可以再|加竖线"
+
+
+def test_proofread_commit_rejects_missing_identity():
+    # c1 已在当前稿删除；回传改动了导出第 1 行 -> 待改身份已删除，整份拒绝
+    current = {
+        "order_ids": ["c2", "c3", "c4"],
+        "clauses": [
+            {"id": "c2", "body": "乙方按 [[c1]] 验收后付款"},
+            {"id": "c3", "body": "争议解决见 [[c2]]"},
+            {"id": "c4", "body": "争议提交仲裁"},
+        ],
+    }
+    text = _proof_text(
+        "1|甲方改为八日内交付",
+        "2|乙方按 [[1]] 验收后付款",
+        "3|争议解决见 [[2]]",
+        "4|争议提交仲裁",
+    )
+    r = client.post(
+        "/api/proofread/commit",
+        json={"snapshot": PROOF_BASE, "current": current, "text": text},
+    )
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    kinds = {c["id"]: c["kind"] for c in detail["conflicts"]}
+    assert kinds.get("c1") == "missing"
+    # 草稿未被改动
+    assert current == {
+        "order_ids": ["c2", "c3", "c4"],
+        "clauses": [
+            {"id": "c2", "body": "乙方按 [[c1]] 验收后付款"},
+            {"id": "c3", "body": "争议解决见 [[c2]]"},
+            {"id": "c4", "body": "争议提交仲裁"},
+        ],
+    }
+
+
+def test_proofread_commit_rejects_when_both_sides_edited_differently():
+    # 当前稿已把 c2 改成另一个正文；离线回传也改了 c2（不同值）-> 冲突
+    current = _proof_doc(
+        "甲方在七日内交付设备",
+        "乙方在当前稿里改成了别的",
+        "争议解决见 [[c2]]",
+        "争议提交仲裁",
+    )
+    text = _proof_text(
+        "1|甲方在七日内交付设备",
+        "2|乙方离线改成这个",
+        "3|争议解决见 [[2]]",
+        "4|争议提交仲裁",
+    )
+    r = client.post(
+        "/api/proofread/commit",
+        json={"snapshot": PROOF_BASE, "current": current, "text": text},
+    )
+    assert r.status_code == 409
+    kinds = {c["id"]: c["kind"] for c in r.json()["detail"]["conflicts"]}
+    assert kinds.get("c2") == "conflict"
+
+
+def test_proofread_accepts_when_current_body_already_equals_uploaded():
+    # 当前稿 c2 已经等于回传值（改动已在当前稿）：可接纳，applied 仍计为改动行
+    current = _proof_doc(
+        "甲方在七日内交付设备",
+        "乙方离线改成这个",
+        "争议解决见 [[c2]]",
+        "争议提交仲裁",
+    )
+    text = _proof_text(
+        "1|甲方在七日内交付设备",
+        "2|乙方离线改成这个",
+        "3|争议解决见 [[2]]",
+        "4|争议提交仲裁",
+    )
+    r = client.post(
+        "/api/proofread/commit",
+        json={"snapshot": PROOF_BASE, "current": current, "text": text},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["applied"] == 1
+    assert r.json()["clauses"][1]["body"] == "乙方离线改成这个"
+
+
+def test_proofread_rejects_changed_line_ref_target_deleted_in_current():
+    # c1 在当前稿已删除：第 1 行回传保持快照原文（不改），第 2 行改动且仍引用 c1
+    # -> 改动行引用目标已删除，整份拒绝；未改的第 1 行不因其身份删除而另列
+    current = {
+        "order_ids": ["c2", "c3", "c4"],
+        "clauses": [
+            {"id": "c2", "body": "乙方按 [[c1]] 验收后付款"},
+            {"id": "c3", "body": "争议解决见 [[c2]]"},
+            {"id": "c4", "body": "争议提交仲裁"},
+        ],
+    }
+    text = _proof_text(
+        "1|甲方在七日内交付设备",
+        "2|乙方改成新文字仍按 [[1]] 验收",
+        "3|争议解决见 [[2]]",
+        "4|争议提交仲裁",
+    )
+    r = client.post(
+        "/api/proofread/commit",
+        json={"snapshot": PROOF_BASE, "current": current, "text": text},
+    )
+    assert r.status_code == 409
+    kinds = {c["id"]: c["kind"] for c in r.json()["detail"]["conflicts"]}
+    assert kinds == {"c2": "target_deleted"}
+
+    # 预演给出同样结论（200，结构化 rejects）
+    rv = client.post(
+        "/api/proofread/preview",
+        json={"snapshot": PROOF_BASE, "current": current, "text": text},
+    )
+    assert rv.status_code == 200
+    assert rv.json()["has_rejections"] is True
+    assert {c["id"]: c["kind"] for c in rv.json()["rejects"]} == {"c2": "target_deleted"}
+
+
+def test_proofread_unchanged_line_keeps_preexisting_broken_ref():
+    # 当前稿 c1 已删除；只改 c4，c2 未改（其失效引用是导出后页面操作产生的）：
+    # 不应阻止接纳 c4 的改动，c2 失效引用保持原样
+    current = {
+        "order_ids": ["c2", "c3", "c4"],
+        "clauses": [
+            {"id": "c2", "body": "乙方按 [[c1]] 验收后付款"},
+            {"id": "c3", "body": "争议解决见 [[c2]]"},
+            {"id": "c4", "body": "争议提交仲裁"},
+        ],
+    }
+    text = _proof_text(
+        "1|甲方在七日内交付设备",
+        "2|乙方按 [[1]] 验收后付款",
+        "3|争议解决见 [[2]]",
+        "4|争议改为诉讼",
+    )
+    r = client.post(
+        "/api/proofread/commit",
+        json={"snapshot": PROOF_BASE, "current": current, "text": text},
+    )
+    assert r.status_code == 200, r.text
+    by_id = {c["id"]: c["body"] for c in r.json()["clauses"]}
+    assert by_id["c2"] == "乙方按 [[c1]] 验收后付款"
+    assert by_id["c4"] == "争议改为诉讼"
+
+
+def test_proofread_commit_respects_latest_lock_set():
+    text = _proof_text(
+        "1|甲方在七日内交付设备",
+        "2|乙方改成锁定条款的新正文",
+        "3|争议解决见 [[2]]",
+        "4|争议提交仲裁",
+    )
+    # 锁定 c2（改动行）：整份拒绝
+    r = client.post(
+        "/api/proofread/commit",
+        json={"snapshot": PROOF_BASE, "current": PROOF_BASE, "text": text, "lock_ids": ["c2"]},
+    )
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert [v["id"] for v in detail["locked"]] == ["c2"]
+    assert detail["locked"][0]["reasons"]
+
+    # 只锁定未改行 c4：改动 c2 仍可接纳（重排与未锁条款不受影响）
+    r = client.post(
+        "/api/proofread/commit",
+        json={"snapshot": PROOF_BASE, "current": PROOF_BASE, "text": text, "lock_ids": ["c4"]},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["applied"] == 1
+
+    # 锁定集合非法（含当前稿不存在身份）：422
+    r = client.post(
+        "/api/proofread/commit",
+        json={"snapshot": PROOF_BASE, "current": PROOF_BASE, "text": text, "lock_ids": ["c9"]},
+    )
+    assert r.status_code == 422
+
+    # 预演同样按最新锁定集合给出拒绝
+    rv = client.post(
+        "/api/proofread/preview",
+        json={"snapshot": PROOF_BASE, "current": PROOF_BASE, "text": text, "lock_ids": ["c2"]},
+    )
+    assert rv.status_code == 200
+    assert {c["id"]: c["kind"] for c in rv.json()["rejects"]} == {"c2": "locked"}
+    assert [v["id"] for v in rv.json()["locked"]] == ["c2"]
+
+
+def test_proofread_no_changes_is_a_noop():
+    text = _proof_text(
+        "1|甲方在七日内交付设备",
+        "2|乙方按 [[1]] 验收后付款",
+        "3|争议解决见 [[2]]",
+        "4|争议提交仲裁",
+    )
+    r = client.post(
+        "/api/proofread/commit",
+        json={"snapshot": PROOF_BASE, "current": PROOF_BASE, "text": text},
+    )
+    assert r.status_code == 200
+    assert r.json()["applied"] == 0
+    rv = client.post(
+        "/api/proofread/preview",
+        json={"snapshot": PROOF_BASE, "current": PROOF_BASE, "text": text},
+    )
+    assert rv.json()["changes"] == []
+    assert rv.json()["has_rejections"] is False
+
+
+def test_proofread_rejects_snapshot_with_broken_refs():
+    snap = _proof_doc("甲方见 [[c9]] 的安排", "乙方验收")
+    r = client.post(
+        "/api/proofread/preview",
+        json={
+            "snapshot": snap,
+            "current": snap,
+            "text": _proof_text("1|甲方见 [[9]] 的安排", "2|乙方验收"),
+        },
+    )
+    assert r.status_code == 422
+
+
+def test_proofread_rejects_snapshot_not_numbered_consecutively():
+    # 快照顺序不是 c1..cn：无法按“导出时编号”无歧义绑定身份
+    snap = {
+        "order_ids": ["c2", "c1"],
+        "clauses": [
+            {"id": "c1", "body": "甲"},
+            {"id": "c2", "body": "乙"},
+        ],
+    }
+    r = client.post(
+        "/api/proofread/preview",
+        json={"snapshot": snap, "current": snap, "text": "1|甲改\n2|乙"},
+    )
+    assert r.status_code == 422
+
+
+def test_proofread_preview_does_not_mutate_any_draft():
+    text = _proof_text(
+        "1|甲方改为三十日",
+        "2|乙方按 [[1]] 验收后付款",
+        "3|争议解决见 [[2]]",
+        "4|争议提交仲裁",
+    )
+    before = {
+        "snapshot": PROOF_BASE,
+        "current": PROOF_BASE,
+        "text": text,
+    }
+    import copy
+
+    payload = copy.deepcopy(before)
+    r = client.post("/api/proofread/preview", json=payload)
+    assert r.status_code == 200
+    assert payload == before

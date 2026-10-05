@@ -45,6 +45,7 @@
           <button id="merge-btn" disabled>合并所选</button>
           <button id="duplicate-btn" disabled>复制所选</button>
           <button id="excerpt-btn" disabled>导出摘录</button>
+          <button id="proofread-btn" disabled>离线校订</button>
           <button id="diff-btn">对照原稿</button>
           <button id="reimport-btn">重新导入</button>
           <button id="download-btn" class="primary" disabled>下载纯文本</button>
@@ -90,6 +91,25 @@
         </p>
         <div id="excerpt-banner" class="banner excerpt-banner" hidden></div>
         <div id="excerpt-body"></div>
+      </section>
+
+      <!-- 离线校订：导出“编号|正文”校订文本，线下改正文后回传，按导出时编号绑定身份 -->
+      <section id="proofread-panel" class="panel proofread-panel" hidden>
+        <div class="proofread-head">
+          <h2>离线校订（导出 → 线下改正文 → 回传）</h2>
+          <div class="proofread-status" id="proofread-status"></div>
+        </div>
+        <p class="hint">
+          点「导出校订文本」按<b>当前已保存草稿</b>生成一份 <code>编号|正文</code> 纯文本（存在失效引用时拒绝导出）：
+          复制到线下编辑，<b>只许改正文</b>——行数、编号、行序必须与导出时逐行一致，正文仍须为单行；
+          行中的 <code>[[数字]]</code> 按<b>导出时的编号</b>绑定条款，不要按回传时的当前编号解释。
+          页面保留<b>最近一次导出快照</b>，导出后继续在页面上改稿不会清空它；重新导入、恢复存档或刷新后清空。
+          回传后先展示改动再确认：只接纳相对快照改动、且当前正文仍等于快照或已等于回传值的行；
+          待改身份已删除、两边改成不同正文、改动行引用目标已删除或违反最新锁定保护时<b>整份拒绝并列原因</b>。
+          未改行、当前顺序、原稿基线与身份上界保持不变；未保存编辑、拆分选择或写稿未结束时不可操作。
+        </p>
+        <div id="proofread-banner" class="banner proofread-banner" hidden></div>
+        <div id="proofread-body"></div>
       </section>
 
       <!-- 合并记录：每次成功合并留一条撤销记录（仅存本页内存），可撤回到当前草稿 -->

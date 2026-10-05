@@ -431,6 +431,44 @@ button.danger:hover:not(:disabled) { background: var(--danger-bg); }
 .excerpt-actions { display: flex; gap: 10px; }
 
 /* --------------------------------------------------------------------------- */
+/* 离线校订（导出文本 + 回传预演 / 提交） */
+/* --------------------------------------------------------------------------- */
+.proofread-panel { border-color: #d8c9f5; background: #fdfbff; }
+.proofread-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.proofread-head h2 { margin-bottom: 4px; }
+.proofread-status { font-size: 12.5px; color: var(--muted); }
+
+.proofread-banner {
+  background: var(--danger-bg);
+  border-color: #f3c4c4;
+  color: var(--danger);
+  padding: 10px 14px;
+  margin: 8px 0 12px;
+}
+.proofread-banner ul { margin: 6px 0 0; padding-left: 20px; }
+
+.proofread-export { margin-bottom: 14px; }
+.proofread-text { min-height: 0; max-height: 260px; margin: 8px 0 0; }
+.proofread-upload-text {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: ui-monospace, monospace;
+  font-size: 13.5px;
+  margin: 6px 0 10px;
+}
+.proofread-reject-list { list-style: none; margin: 0 0 10px; padding: 0; }
+.proofread-reject {
+  border: 1px solid #f3c4c4;
+  background: var(--danger-bg);
+  border-radius: 6px;
+  padding: 6px 12px;
+  margin-bottom: 6px;
+  font-size: 13px;
+}
+.proofread-reject .diff-nums { margin-left: 8px; }
+.proofread-reject ul { margin: 4px 0 0; padding-left: 20px; color: var(--danger); }
+
+/* --------------------------------------------------------------------------- */
 /* 逐条复核（未复核项列表 + 复核稿下载） */
 /* --------------------------------------------------------------------------- */
 .review-panel { border-color: #b7e4c7; background: #fbfefc; }
