@@ -2236,3 +2236,236 @@ def test_merge_undo_does_not_revive_broken_refs_and_keeps_other_bodies():
     preview = r.json()
     c2 = next(it for it in preview["items"] if it["id"] == "c2")
     assert any(b["ref_id"] == "c9" for b in c2["broken"])
+
+
+# --------------------------------------------------------------------------- #
+# 离线校订回传（/api/offline/preview、/api/offline/commit）
+# --------------------------------------------------------------------------- #
+OFFLINE_DOC = {
+    "order_ids": ["c1", "c2", "c3"],
+    "clauses": [
+        {"id": "c1", "body": "甲方在七日内交付设备"},
+        {"id": "c2", "body": "乙方按 [[c1]] 验收后付款"},
+        {"id": "c3", "body": "争议提交仲裁"},
+    ],
+}
+
+
+def _offline(snapshot, text, current, lock_ids=None, path="/api/offline/preview"):
+    payload = {"snapshot": snapshot, "text": text, **current}
+    if lock_ids is not None:
+        payload["lock_ids"] = lock_ids
+    return client.post(path, json=payload)
+
+
+def _by_id(resp):
+    return {c["id"]: c["body"] for c in resp.json()["clauses"]}
+
+
+def test_offline_preview_and_commit_apply_changed_lines_only():
+    text = "1|甲方在七日内交付设备\n2|乙方验收合格后按 [[1]] 付款\n3|争议提交仲裁"
+    r = _offline(OFFLINE_DOC, text, OFFLINE_DOC, [])
+    assert r.status_code == 200
+    data = r.json()
+    assert data["change_count"] == 1
+    (ch,) = data["changes"]
+    assert ch["id"] == "c2" and ch["status"] == "changed"
+    assert ch["export_no"] == 2 and ch["current_no"] == 2
+    assert ch["old_body"] == "乙方按 [[c1]] 验收后付款"
+    assert _by_id(r)["c2"] == "乙方验收合格后按 [[c1]] 付款"
+    # 预演不修改入参草稿（接口无状态；此处验证返回的未改行逐字保留、顺序不变）
+    assert data["order_ids"] == ["c1", "c2", "c3"]
+
+    r = _offline(OFFLINE_DOC, text, OFFLINE_DOC, [], path="/api/offline/commit")
+    assert r.status_code == 200
+    assert _by_id(r)["c1"] == "甲方在七日内交付设备"
+    assert _by_id(r)["c3"] == "争议提交仲裁"
+
+
+def test_offline_binds_refs_by_export_number_not_current():
+    # 当前稿已重排：导出编号 2（c2）当前显示为 3；回传 [[3]] 仍按导出编号绑定 c3
+    current = {
+        "order_ids": ["c1", "c3", "c2"],
+        "clauses": OFFLINE_DOC["clauses"],
+    }
+    text = "1|甲方在七日内交付设备\n2|见 [[3]]\n3|争议提交仲裁"
+    r = _offline(OFFLINE_DOC, text, current, [])
+    assert r.status_code == 200
+    bodies = _by_id(r)
+    assert bodies["c2"] == "见 [[c3]]"
+    assert bodies["c3"] == "争议提交仲裁"
+    assert r.json()["order_ids"] == ["c1", "c3", "c2"]  # 当前顺序不变
+
+
+def test_offline_unchanged_upload_is_noop_even_with_all_locked():
+    text = "1|甲方在七日内交付设备\n2|乙方按 [[1]] 验收后付款\n3|争议提交仲裁"
+    r = _offline(
+        OFFLINE_DOC, text, OFFLINE_DOC, ["c1", "c2", "c3"], path="/api/offline/commit"
+    )
+    assert r.status_code == 200
+    assert r.json()["change_count"] == 0
+    assert _by_id(r)["c2"] == "乙方按 [[c1]] 验收后付款"
+
+
+def test_offline_current_equal_uploaded_is_idempotent_applied():
+    # 当前稿 c2 已等于回传正文（此前已接纳）：不再处理，标记 applied
+    current = {
+        "order_ids": OFFLINE_DOC["order_ids"],
+        "clauses": [
+            {"id": "c1", "body": "甲方在七日内交付设备"},
+            {"id": "c2", "body": "乙方验收合格后按 [[c1]] 付款"},
+            {"id": "c3", "body": "争议提交仲裁"},
+        ],
+    }
+    text = "1|甲方在七日内交付设备\n2|乙方验收合格后按 [[1]] 付款\n3|争议提交仲裁"
+    r = _offline(OFFLINE_DOC, text, current, [], path="/api/offline/commit")
+    assert r.status_code == 200
+    assert r.json()["change_count"] == 0
+    (ch,) = r.json()["changes"]
+    assert ch["status"] == "applied"
+
+
+def test_offline_rejects_missing_target_identity():
+    # 待改行 c2 的身份已从当前稿删除：整份拒绝
+    current = {
+        "order_ids": ["c1", "c3"],
+        "clauses": [
+            {"id": "c1", "body": "甲方在七日内交付设备"},
+            {"id": "c3", "body": "争议提交仲裁"},
+        ],
+    }
+    text = "1|甲方在七日内交付设备\n2|乙方验收合格后按 [[1]] 付款\n3|争议提交仲裁"
+    r = _offline(OFFLINE_DOC, text, current, [])
+    assert r.status_code == 409
+    ids = {c["id"] for c in r.json()["detail"]["conflicts"]}
+    assert "c2" in ids
+
+
+def test_offline_rejects_divergent_both_sides_edited():
+    # 当前稿 c2 已改成与快照、回传都不同的正文：两边改成不同正文，整份拒绝
+    current = {
+        "order_ids": OFFLINE_DOC["order_ids"],
+        "clauses": [
+            {"id": "c1", "body": "甲方在七日内交付设备"},
+            {"id": "c2", "body": "乙方在线验收后付款"},
+            {"id": "c3", "body": "争议提交仲裁"},
+        ],
+    }
+    text = "1|甲方在七日内交付设备\n2|乙方验收合格后按 [[1]] 付款\n3|争议提交仲裁"
+    r = _offline(OFFLINE_DOC, text, current, [])
+    assert r.status_code == 409
+    assert r.json()["detail"]["conflicts"][0]["id"] == "c2"
+
+
+def test_offline_rejects_when_uploaded_ref_target_deleted():
+    # 回传改动行引用导出编号 2（c2），但 c2 已从当前稿删除：接纳会产生新失效引用
+    snapshot = {
+        "order_ids": ["c1", "c2", "c3", "c4"],
+        "clauses": [
+            {"id": "c1", "body": "甲"},
+            {"id": "c2", "body": "乙"},
+            {"id": "c3", "body": "丙"},
+            {"id": "c4", "body": "丁"},
+        ],
+    }
+    current = {
+        "order_ids": ["c1", "c3", "c4"],
+        "clauses": [
+            {"id": "c1", "body": "甲"},
+            {"id": "c3", "body": "丙"},
+            {"id": "c4", "body": "丁"},
+        ],
+    }
+    text = "1|甲见 [[2]]\n2|乙\n3|丙\n4|丁"
+    r = _offline(snapshot, text, current, [])
+    assert r.status_code == 409
+    assert r.json()["detail"]["conflicts"][0]["id"] == "c1"
+
+
+def test_offline_unmodified_line_keeps_preexisting_broken_ref():
+    # 未改行中既有的失效引用（删除残留）不阻止回传；改动行只引用现存目标
+    snapshot = {
+        "order_ids": ["c1", "c2", "c3", "c4"],
+        "clauses": [
+            {"id": "c1", "body": "甲"},
+            {"id": "c2", "body": "乙 [[c4]]"},
+            {"id": "c3", "body": "丙"},
+            {"id": "c4", "body": "丁"},
+        ],
+    }
+    current = {
+        "order_ids": ["c1", "c2", "c3"],
+        "clauses": [
+            {"id": "c1", "body": "甲"},
+            {"id": "c2", "body": "乙 [[c4]]"},
+            {"id": "c3", "body": "丙"},
+        ],
+    }
+    text = "1|甲改\n2|乙 [[4]]\n3|丙\n4|丁"
+    r = _offline(snapshot, text, current, [], path="/api/offline/commit")
+    assert r.status_code == 200
+    bodies = _by_id(r)
+    assert bodies["c1"] == "甲改"
+    assert bodies["c2"] == "乙 [[c4]]"  # 未改行原样保留（含既有失效引用）
+
+
+def test_offline_lock_protection_rejects_changed_locked_clause():
+    text = "1|甲方在七日内交付设备\n2|乙方验收合格后按 [[1]] 付款\n3|争议提交仲裁"
+    r = _offline(OFFLINE_DOC, text, OFFLINE_DOC, ["c2"], path="/api/offline/commit")
+    assert r.status_code == 409
+    assert r.json()["detail"]["locked"][0]["id"] == "c2"
+    # 锁定其他未改行：允许
+    r = _offline(OFFLINE_DOC, text, OFFLINE_DOC, ["c3"], path="/api/offline/commit")
+    assert r.status_code == 200
+
+
+def test_offline_text_structure_errors_are_422():
+    base_text = "1|甲方在七日内交付设备\n2|乙方按 [[1]] 验收后付款\n3|争议提交仲裁"
+    cases = [
+        "1|甲\n2|乙",  # 行数不一致
+        "1|甲\n3|乙\n2|丙",  # 编号 / 行序不一致
+        "1|甲\n2|乙 [[9]]\n3|丙",  # 引用超出导出编号范围
+        "1|\n2|乙\n3|丙",  # 正文为空
+        "1|甲 [[2\n2|乙\n3|丙",  # 引用标记未闭合
+    ]
+    for text in cases:
+        r = _offline(OFFLINE_DOC, text, OFFLINE_DOC, [])
+        assert r.status_code == 422, text
+
+
+def test_offline_snapshot_with_broken_ref_is_422():
+    snapshot = {
+        "order_ids": ["c1", "c2", "c3"],
+        "clauses": [
+            {"id": "c1", "body": "甲 [[c9]]"},
+            {"id": "c2", "body": "乙"},
+            {"id": "c3", "body": "丙"},
+        ],
+    }
+    text = "1|甲\n2|乙\n3|丙"
+    r = _offline(snapshot, text, OFFLINE_DOC, [])
+    assert r.status_code == 422
+
+
+def test_offline_after_split_or_duplicate_binds_by_export_numbers_and_keeps_new_ids():
+    # 导出快照只有 c1、c2；当前稿经复制新增 c6 插在中间。回传引用 [[2]] 绑定 c2，
+    # 新身份 c6 的正文与当前顺序保持不变，身份上界语义由调用方持有（接口不改顺序/身份集）
+    snapshot = {
+        "order_ids": ["c1", "c2"],
+        "clauses": [{"id": "c1", "body": "甲"}, {"id": "c2", "body": "乙"}],
+    }
+    current = {
+        "order_ids": ["c1", "c6", "c2"],
+        "clauses": [
+            {"id": "c1", "body": "甲"},
+            {"id": "c6", "body": "新复制"},
+            {"id": "c2", "body": "乙"},
+        ],
+    }
+    text = "1|甲改 [[2]]\n2|乙"
+    r = _offline(snapshot, text, current, [], path="/api/offline/commit")
+    assert r.status_code == 200
+    bodies = _by_id(r)
+    assert bodies["c1"] == "甲改 [[c2]]"
+    assert bodies["c6"] == "新复制"
+    assert r.json()["order_ids"] == ["c1", "c6", "c2"]

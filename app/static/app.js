@@ -53,6 +53,16 @@ const state = {
   archiveError: null, // 最近一次存档操作失败的错误信息（数组）
   archiveConflict: null, // 最近一次 409 冲突时服务端的当前版本（数字）；读取最新版本或保存 / 恢复成功后清空
   archiveNotice: null, // 存档提示（如"已读取最新版本 v3"、"服务端暂无存档"）
+  offlineSnapshot: null, // 最近一次整稿导出（下载纯文本）成功时留存的导出快照：
+  // { order_ids, clauses（内部形态） }——引用按导出时编号绑定身份，不按当前编号解释；
+  // 仅存本页内存：继续改稿不清空，换稿（重新导入 / 恢复存档）或刷新页面才清空
+  offlineText: "", // 离线回传面板文本框中的回传文本（取消 / 失败不清空，便于修改重试）
+  offlineData: null, // 最近一次与当前稿 + 回传文本 + 快照一致的 /api/offline/preview 结果（改动明细）
+  offlineError: null, // 最近一次离线预演 / 提交失败的错误信息（数组）
+  offlineFresh: false, // 预演结果是否仍对应当前稿与文本框内容；改稿或编辑文本即失效
+  offlinePreviewing: false, // /api/offline/preview 在途
+  // 预演请求序号（offlinePreviewSeq）在模块级：只采用最后一次发出的响应，
+  // 改稿 / 换稿 / 新预演 / 文本编辑会作废旧响应
   lockIds: [], // 条款锁定集合（稳定身份）：仅存本页内存，随写稿请求提交、由后端按实际结果核验；
   // 换稿（重新导入 / 恢复存档）或刷新清空，不进存档快照；锁定切换不改草稿、不推进修订号、不改复核
 };
@@ -71,6 +81,7 @@ let refsInFlight = false; // 是否已有 /api/referrers 在途：防止重复�
 let excerptSeq = 0; // 摘录请求序号：改稿 / 切换勾选 / 重新导入 / 新请求都会推进，迟到响应一律丢弃
 let reviewExportSeq = 0; // 复核稿下载序号：重新导入 / 恢复存档 / 新下载都会推进，
 // 旧下载的响应与收尾一律失效——不得保存旧文件、弹提示或影响新下载
+let offlinePreviewSeq = 0; // 离线预演序号：只采用最后一次发出的预演响应，改稿 / 换稿 / 新预演作废旧响应
 
 const MARKER = /\[\[(?:原(\d+)\?|(\d+))\]\]/g; // 预览文本中的引用形态
 
@@ -112,6 +123,13 @@ const archiveSaveBtn = $("#archive-save-btn");
 const archiveRestoreBtn = $("#archive-restore-btn");
 const archiveRestoreImportBtn = $("#archive-restore-import-btn");
 const archiveBanner = $("#archive-banner");
+const offlinePanel = $("#offline-panel");
+const offlineStatus = $("#offline-status");
+const offlineBanner = $("#offline-banner");
+const offlineTextArea = $("#offline-text");
+const offlinePreviewBtn = $("#offline-preview-btn");
+const offlineCommitBtn = $("#offline-commit-btn");
+const offlineBody = $("#offline-body");
 
 // --------------------------------------------------------------------------- //
 // 工具
@@ -406,6 +424,9 @@ function touch() {
   state.refsError = null;
   // 勾选条款摘录同理：改稿立即清空旧结果与提示，在途请求的迟到响应一律丢弃
   clearExcerpt();
+  // 离线校订回传同理：改稿后旧预演结果立即失效（快照本身保留——继续改稿不清空它，
+  // 提交时后端按当前稿重新核验）；在途预演的迟到响应一律丢弃
+  invalidateOfflinePreview();
   // 每次改稿成功后核对复核记录：记录中的正文或目标存续有变化的，该条复核立即清除；
   // 纯重排、编号平移与无关改动保留复核；清除后改回旧文也不自动恢复
   pruneReviews();
@@ -424,6 +445,7 @@ function syncToolbar() {
   syncArchiveUi();
   syncReviewPanel();
   syncMergePanel();
+  syncOfflinePanel();
   syncBusy();
 }
 
@@ -828,6 +850,9 @@ function installArchive(snap, version) {
   reviewExportSeq += 1;
   // 合并撤销记录仅存本页内存：成功恢复存档即清空（已清除记录不恢复）
   state.mergeRecords = [];
+  // 最近导出快照、回传文本与预演结果仅存本页内存：恢复存档即换稿，全部清空
+  // （在途预演的迟到响应因序号作废，不作用于恢复后的草稿）
+  clearOffline();
   state.preview = null;
   state.previewError = null;
   state.renderedRev = null;
@@ -1003,6 +1028,9 @@ $("#reimport-btn").addEventListener("click", () => {
   reviewExportSeq += 1;
   // 合并撤销记录仅存本页内存：重新导入即清空
   state.mergeRecords = [];
+  // 最近导出快照仅存本页内存：重新导入即换稿，快照 / 回传文本 / 预演结果全部清空，
+  // 在途预演的迟到响应不得作用于新稿
+  clearOffline();
   previewInFlight = false; // 上一草稿在途预览的收尾将因世代不符而直接返回，这里复位在途态
   desk.hidden = true;
   importPanel.hidden = false;
@@ -1297,6 +1325,7 @@ function editorHtml(item) {
 //   params,            // 入口备好的接口参数（草稿快照与 lock_ids 由协调层统一附上）
 //   repointed?,        // 成功回包按最新锁定集合核验时的统一改指映射（合并 / 拆分落后段）
 //   onSuccess(data)?,  // 入口附加的成功处理（如收起被并条款的引用面板、退出拆分选择器）
+//   afterTouch(data)?, // touch()（使预览/对照/离线预演等失效并清理复核）之后的成功处理
 //   onError(errors)?,  // 入口各自的错误展示（errors 已归一化为字符串数组）
 //   onBusy(busy)?,     // 入口自己的忙碌态展示（如拆分选择器按钮；成功不写回时不再复位）
 // }
@@ -1338,6 +1367,7 @@ async function submitWrite(spec) {
     state.writing = null;
     if (spec.onSuccess) spec.onSuccess(data);
     touch();
+    if (spec.afterTouch) spec.afterTouch(data);
     render();
   } catch (e) {
     if (token !== writeSeq || epoch !== state.epoch) return; // 旧请求的失败不在新稿上提示
@@ -2656,6 +2686,247 @@ reviewDownloadBtn.addEventListener("click", async () => {
 });
 
 // --------------------------------------------------------------------------- //
+// 离线校订回传（整稿导出快照 + 回传文本：预演后提交，复用写稿协调层）
+// --------------------------------------------------------------------------- //
+// 最近一次整稿导出（下载纯文本）成功时留存导出快照（仅存本页内存）：
+// 继续改稿不清空快照；换稿（重新导入 / 恢复存档）或刷新页面才清空。
+// 回传文本只许改正文：行数、编号、行序不变；引用按**导出时编号**绑定身份，
+// 不按当前编号解释。预演只展示改动；提交复用写稿提交协调层，按当前稿重新核验，
+// 仅处理相对快照改动的行。
+function offlineSnapshotPayload() {
+  const snap = state.offlineSnapshot;
+  return {
+    order_ids: snap.order_ids.slice(),
+    clauses: snap.clauses.map((c) => ({ id: c.id, body: c.body })),
+  };
+}
+
+// 预演结果失效：改稿或文本被编辑后立即标记（快照保留）；在途预演序号同时作废
+function invalidateOfflinePreview() {
+  if (!state.offlineSnapshot) return;
+  state.offlineData = null;
+  state.offlineFresh = false;
+  offlinePreviewSeq += 1;
+  state.offlinePreviewing = false;
+  syncOfflinePanel();
+}
+
+// 换稿（重新导入 / 恢复存档）或刷新：快照与一切离线回传状态全部清空
+function clearOffline() {
+  state.offlineSnapshot = null;
+  state.offlineText = "";
+  state.offlineData = null;
+  state.offlineError = null;
+  state.offlineFresh = false;
+  state.offlinePreviewing = false;
+  offlinePreviewSeq += 1;
+  if (offlineTextArea) offlineTextArea.value = "";
+  syncOfflinePanel();
+}
+
+function offlineBusy() {
+  return state.editingId !== null || state.splittingId !== null || state.writing !== null;
+}
+
+// 面板状态、提示与改动明细的统一同步
+function syncOfflinePanel() {
+  if (!offlinePanel) return;
+  const snap = state.offlineSnapshot;
+  if (!snap) {
+    offlineStatus.textContent = "";
+    offlineBanner.hidden = true;
+    offlineBanner.textContent = "";
+    offlineBody.innerHTML =
+      '<p class="muted">尚无导出快照：点工具栏「下载纯文本」导出无失效引用的整稿后，' +
+      "可在此粘贴离线校订文本回传。继续改稿不会清空最近导出；重新导入、恢复存档或刷新页面后清空。</p>";
+    offlinePreviewBtn.disabled = true;
+    offlineCommitBtn.disabled = true;
+    return;
+  }
+
+  if (state.offlineError) {
+    offlineBanner.hidden = false;
+    offlineBanner.innerHTML =
+      `<strong>离线校订${state.offlinePreviewing ? "预演" : "提交"}失败，草稿未改动。</strong>` +
+      `<ul>${state.offlineError.map((m) => `<li>${esc(m)}</li>`).join("")}</ul>`;
+  } else {
+    offlineBanner.hidden = true;
+    offlineBanner.textContent = "";
+  }
+
+  const busy = offlineBusy();
+  offlinePreviewBtn.disabled = busy || state.offlinePreviewing || !state.offlineText.trim();
+  offlinePreviewBtn.textContent = state.offlinePreviewing ? "预演中…" : "预演改动";
+  // 提交须先看到与当前稿一致的预演结果（文本再编辑或改稿后须重新预演）
+  offlineCommitBtn.disabled = busy || !state.offlineFresh || !state.offlineData;
+  offlineCommitBtn.textContent = state.writing === "offline-commit" ? "提交中…" : "确认提交";
+  offlineCommitBtn.title = busy
+    ? "未保存编辑、拆分选择或写稿提交未结束时不可回传"
+    : !state.offlineFresh
+      ? "请先预演，确认改动明细后再提交"
+      : "按当前稿重新核验，仅接回相对导出快照改动的行";
+
+  const changed = state.offlineData
+    ? state.offlineData.changes.filter((it) => it.status === "changed").length
+    : 0;
+  const applied = state.offlineData
+    ? state.offlineData.changes.filter((it) => it.status === "applied").length
+    : 0;
+  if (state.offlinePreviewing) offlineStatus.textContent = "预演中…";
+  else if (!state.offlineData)
+    offlineStatus.textContent = `已留存最近导出快照（${snap.order_ids.length} 条）；粘贴回传文本后点「预演改动」`;
+  else if (!state.offlineFresh)
+    offlineStatus.textContent = "预演结果已失效（草稿或回传文本有变化），请重新预演";
+  else
+    offlineStatus.textContent =
+      `预演完成：${changed} 行将接回` + (applied ? `，${applied} 行当前已等于回传正文（跳过）` : "");
+
+  offlineBody.innerHTML = state.offlineData ? offlineChangesHtml(state.offlineData) : "";
+}
+
+// 把内部形态正文（[[cX]]）按**当前稿**解析成人读形态（现存身份显示当前编号，
+// 已删除身份显示 [[原X?]]），用于改动明细
+function offlineDisplayBody(body) {
+  return body.replace(/\[\[(c\d+)\]\]/g, (m, cid) => {
+    const pos = state.orderIds.indexOf(cid);
+    return pos >= 0 ? `[[${pos + 1}]]` : `[[原${cid.slice(1)}?]]`;
+  });
+}
+
+function offlineChangesHtml(data) {
+  if (!data.changes.length) {
+    return '<p class="muted">回传正文与导出快照逐行相同：没有需要接回的改动。</p>';
+  }
+  const rows = data.changes
+    .map((it) => {
+      const tag =
+        it.status === "applied"
+          ? '<span class="diff-tag tag-move">已在稿上（幂等跳过）</span>'
+          : '<span class="diff-tag tag-body">将接回</span>';
+      return (
+        `<li class="diff-row">
+          <div class="diff-row-head">${tag}
+            <span class="diff-nums">导出编号 ${it.export_no} → 当前编号 ${
+              it.current_no === null || it.current_no === undefined ? "（已删除）" : it.current_no
+            }
+            <span class="diff-id">（稳定身份 ${esc(it.id)}，原第 ${it.original} 条）</span></span>
+          </div>
+          <div class="diff-bodies">
+            <div class="diff-col"><span class="diff-col-label">导出快照正文</span>
+              <div class="diff-text">${esc(offlineDisplayBody(it.old_body))}</div></div>
+            <div class="diff-col"><span class="diff-col-label">回传正文（引用按导出编号绑定）</span>
+              <div class="diff-text">${esc(offlineDisplayBody(it.new_body))}</div></div>
+          </div>
+        </li>`
+      );
+    })
+    .join("");
+  return `<ul class="diff-list">${rows}</ul>`;
+}
+
+// 预演：把快照、回传文本、当前稿与最新锁定集合发给后端；只展示改动，不改正文。
+// 只采用最后一次发出、且仍对应当前稿与文本内容的响应；改稿 / 换稿后迟到响应丢弃。
+async function offlinePreview() {
+  if (!state.offlineSnapshot || state.offlinePreviewing) return;
+  if (offlineBusy()) return;
+  const text = state.offlineText;
+  if (!text.trim()) return;
+  const token = ++offlinePreviewSeq;
+  const epoch = state.epoch;
+  const rev = state.rev;
+  state.offlinePreviewing = true;
+  state.offlineError = null;
+  syncOfflinePanel();
+  let data;
+  try {
+    data = await api("/api/offline/preview", {
+      snapshot: offlineSnapshotPayload(),
+      text,
+      ...snapshot(),
+      lock_ids: lockPayload(),
+    });
+  } catch (e) {
+    if (token !== offlinePreviewSeq || epoch !== state.epoch || rev !== state.rev) return;
+    state.offlinePreviewing = false;
+    state.offlineError = errorList(e);
+    state.offlineData = null;
+    state.offlineFresh = false;
+    syncOfflinePanel();
+    return;
+  }
+  if (token !== offlinePreviewSeq || epoch !== state.epoch || rev !== state.rev) return;
+  if (text !== state.offlineText) return; // 等待期间文本又被编辑：结果不再适用
+  state.offlinePreviewing = false;
+  if (!data || !Array.isArray(data.changes)) {
+    state.offlineError = ["预演响应正文不完整，请重试。"];
+    state.offlineFresh = false;
+    syncOfflinePanel();
+    return;
+  }
+  state.offlineData = data;
+  state.offlineError = null;
+  state.offlineFresh = true;
+  syncOfflinePanel();
+}
+
+// 提交：复用写稿提交协调层（互斥、携带最新 lock_ids、成功回包按最新锁定集合再核验、
+// 旧响应隔离、touch 清理复核并刷新预览；预览失败保留提交稿、仅重试预览）。
+async function offlineCommit() {
+  if (!state.offlineSnapshot || !state.offlineFresh || !state.offlineData) return;
+  if (offlineBusy()) return;
+  const changed = state.offlineData.changes.filter((it) => it.status === "changed").length;
+  const ok = confirm(
+    changed
+      ? `将把预演中的 ${changed} 行离线校订接回当前草稿（仅改正文，顺序、编号、基线与身份上界不变）。\n` +
+          "后端会按当前稿与最新锁定集合重新核验：待改身份已删除、两边改成不同正文、\n" +
+          "回传引用目标已删除或违反锁定保护时整份拒绝。确定提交？"
+      : "回传正文相对导出快照没有需要接回的新改动（可能此前已接纳）。仍要提交一次吗？",
+  );
+  if (!ok) return;
+  const text = state.offlineText;
+  await submitWrite({
+    kind: "offline-commit",
+    path: "/api/offline/commit",
+    params: { snapshot: offlineSnapshotPayload(), text },
+    // 离线提交不增删身份、不重排：锁定核验只可能命中“锁定条款正文被改动”
+    afterTouch: (data) => {
+      // touch() 已使旧预演失效：这里用提交回执重建与提交后草稿一致的明细。
+      // 回执中的行按提交前状态标记（changed=本次接回）；提交完成后它们都已在稿上，
+      // 本地翻成 applied（current_body 同步为回传正文），导出快照本身保留。
+      const changes = (data.changes || []).map((it) =>
+        it.status === "changed"
+          ? { ...it, status: "applied", current_body: it.new_body }
+          : it,
+      );
+      state.offlineData = { ...data, changes };
+      state.offlineError = null;
+      state.offlineFresh = true;
+      syncOfflinePanel();
+    },
+    onError: (errors) => {
+      // 提交被拒绝（冲突 / 锁定 / 422 / 断网）：草稿与快照均保留，回传文本不清空
+      state.offlineError = errors;
+      state.offlineFresh = false;
+      syncOfflinePanel();
+    },
+  });
+}
+
+offlinePreviewBtn.addEventListener("click", offlinePreview);
+offlineCommitBtn.addEventListener("click", offlineCommit);
+// 文本框内容一旦被编辑，已有预演结果立即失效（须重新预演才能提交）；文本本身保留
+offlineTextArea.addEventListener("input", () => {
+  state.offlineText = offlineTextArea.value;
+  if (state.offlineFresh || state.offlineData) {
+    state.offlineData = null;
+    state.offlineFresh = false;
+    state.offlineError = null;
+    offlinePreviewSeq += 1;
+    syncOfflinePanel();
+  }
+});
+
+// --------------------------------------------------------------------------- //
 // 合并记录与误合并撤销（记录仅存本页内存；撤销经 /api/merge/undo）
 // --------------------------------------------------------------------------- //
 // 把内部形态正文（[[cX]]）解析成便于人读的当前形态：现存身份显示为 [[当前编号]]，
@@ -2807,6 +3078,19 @@ downloadBtn.addEventListener("click", async () => {
     a.download = `clauses-${stamp}.txt`;
     a.click();
     URL.revokeObjectURL(url);
+    // 留存“最近一次导出”快照（仅存本页内存）：回传文本的编号按这份快照绑定身份。
+    // 重新导出覆盖旧快照与旧回传文本；继续改稿不清空快照，换稿 / 恢复存档 / 刷新才清空。
+    state.offlineSnapshot = {
+      order_ids: state.orderIds.slice(),
+      clauses: state.clauses.map((c) => ({ id: c.id, body: c.body })),
+    };
+    state.offlineText = "";
+    state.offlineData = null;
+    state.offlineError = null;
+    state.offlineFresh = false;
+    offlinePreviewSeq += 1;
+    if (offlineTextArea) offlineTextArea.value = "";
+    syncOfflinePanel();
   } catch (e) {
     if (token !== exportSeq || epoch !== state.epoch || rev !== state.rev) return; // 已不属于当前下载：不提示
     alert(errorList(e).join("\n"));

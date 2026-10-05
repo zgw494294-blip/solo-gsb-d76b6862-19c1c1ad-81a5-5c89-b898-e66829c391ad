@@ -480,3 +480,13 @@ button.danger:hover:not(:disabled) { background: var(--danger-bg); }
 .merge-source-list li { padding: 2px 0; }
 .merge-body-before, .merge-body-after { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
 .merge-empty { color: var(--muted); font-size: 13px; margin: 4px 0; }
+
+/* --------------------------------------------------------------------------- */
+/* 离线校订回传 */
+/* --------------------------------------------------------------------------- */
+.offline-panel { border-color: #b9d7f3; background: #f7fbff; }
+.offline-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.offline-head h2 { margin-bottom: 4px; }
+.offline-status { font-size: 12.5px; color: var(--muted); }
+#offline-text { width: 100%; box-sizing: border-box; margin-top: 8px; }
+#offline-body { margin-top: 10px; }

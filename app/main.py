@@ -92,6 +92,22 @@
   被引用条款的正文（只保证引用目标仍存在）。复制始终允许，副本取得新身份、不锁定。
 - 含失效引用的条款不能锁定（该状态无法保证"有效引用的目标存续"）；锁定后引用一旦失效，
   造成失效的写稿操作即按上条整次拒绝。
+
+离线校订回传（``POST /api/offline/preview`` / ``POST /api/offline/commit``）：
+- 页面从整稿导出（无失效引用）得到“编号|正文”校订文本的同时，在本页内存留存**最近一次
+  导出快照**：导出当刻的顺序（稳定身份）与内部正文。继续改稿不清空快照；换稿（重新导入 /
+  恢复存档）或刷新页面才清空。
+- 回传文本只许改正文：行数、编号、行序必须与导出时一致（编号按导出时 1..n 原样排列），
+  沿用单行正文校验（非空、无换行、引用写作 ``[[数字]]``、引用目标在导出时编号范围内）。
+  引用**按导出时编号绑定身份**（快照顺序位置即身份），不按当前编号解释。
+- 预演（preview）只展示改动不改稿；提交（commit）按**当前稿**重新核验，仅处理相对快照
+  正文有改动的行。对每条改动行，当前正文须仍等于快照正文（导出版），或已等于回传新正文
+  （该改动此前已接纳）；当前正文等于回传值的行不再处理。
+- 待改身份已删除、两边改成不同正文（当前既非快照值也非回传值）、改动行回传引用的目标
+  身份已删除，或改动违反最新锁定集合保护时，**整份拒绝并列原因**（409）。回传文本或快照
+  结构非法（422）。通过后：改动行正文写回，未改行、当前顺序、原稿基线与身份上界均不变。
+- 回传不新增 / 删除条款，因此不改变身份集合：回传正文只能引用导出时存在的身份；其中目标
+  已被当前稿删除的按上条整份拒绝（不会接纳新的失效引用）。取消或失败一律不改稿。
 """
 
 from __future__ import annotations
@@ -243,6 +259,23 @@ class ArchiveSnapshotIn(BaseModel):
 class ArchivePutIn(BaseModel):
     version: int  # 最近读取或保存成功得到的版本；空槽为 0
     snapshot: ArchiveSnapshotIn
+
+
+class OfflineSnapshotIn(StateIn):
+    """页面留存的“最近一次导出快照”：导出当刻的顺序（稳定身份）与内部正文。
+
+    引用按导出时编号绑定身份，即快照顺序位置（第 i 个身份）即导出编号 i。
+    """
+
+
+class OfflineIn(BaseModel):
+    # 回传预演 / 提交共用入参：导出快照、离线校订文本（“编号|正文”多行文本）、
+    # 当前稿与最新锁定集合。服务端不持有快照，每次都按提交的当前稿重新核验。
+    snapshot: OfflineSnapshotIn
+    text: str  # 离线回传文本：每行“导出编号|正文”；行数、编号、行序须与快照一致
+    order_ids: list[str]
+    clauses: list[ClauseIn]
+    lock_ids: list[str] | None = None  # 提交当刻的最新锁定集合；None 按无锁定处理
 
 
 # --------------------------------------------------------------------------- #
@@ -1607,6 +1640,284 @@ def write_archive(payload: ArchivePutIn):
     finally:
         conn.close()
     return {"version": current + 1}
+
+
+# --------------------------------------------------------------------------- #
+# 离线校订回传（导出快照 + 回传文本，按当前稿预演 / 提交）
+# --------------------------------------------------------------------------- #
+def _parse_offline_text(text: str, snapshot_order: list[str]) -> tuple[dict[str, str] | None, list[str]]:
+    """解析离线回传文本，返回 导出编号(1起) -> 内部正文。
+
+    回传文本只许改正文：行数、编号、行序必须与导出快照一致（编号 1..n 按快照顺序
+    原样排列，不重编号）；沿用单行正文校验（非空、无换行、引用写作 ``[[数字]]``）。
+    引用**按导出时编号绑定身份**：编号 i 对应快照顺序第 i 个身份，不按当前编号解释。
+    """
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.split("\n")
+    # 与导入一致：仅容忍结尾空行（粘贴时常见），中间 / 开头空行拒收
+    while lines and lines[-1].strip() == "":
+        lines.pop()
+
+    n = len(snapshot_order)
+    errors: list[str] = []
+    if len(lines) != n:
+        return None, [
+            f"回传文本行数（{len(lines)}）与导出版（{n} 行）不一致："
+            "离线校订只许改正文，不能增删、重排行或修改编号"
+        ]
+
+    parsed: list[tuple[int, str, str]] = []  # (行号1起, 编号, 正文（回传形态）)
+    for i, line in enumerate(lines, 1):
+        if "|" not in line:
+            errors.append(f"第 {i} 行缺少分隔符“|”，格式须为“编号|正文”")
+            continue
+        head, body = line.split("|", 1)
+        head = head.strip()
+        if not head.isdigit():
+            errors.append(f"第 {i} 行编号“{head or '（空）'}”不是正整数")
+            continue
+        num = int(head)
+        if head != str(num):
+            errors.append(f"第 {i} 行编号“{head}”含前导零，编号须写作 {num}")
+        if body.strip() == "":
+            errors.append(f"第 {i} 行正文为空")
+        if "\n" in body:
+            errors.append(f"第 {i} 行不是单行条款")
+        refs, ref_errors = scan_raw_refs(body)
+        for err in ref_errors:
+            errors.append(f"第 {i} 行：{err}")
+        for ref in refs:
+            if not (1 <= ref <= n):
+                errors.append(
+                    f"第 {i} 行引用无目标：[[{ref}]]（导出时有效编号为 1～{n}；"
+                    "引用按导出时编号绑定，不按当前编号解释）"
+                )
+        parsed.append((i, num, body))
+
+    # 编号、行序必须与导出时逐行一致（1..n）
+    for i, num, _ in parsed:
+        if num != i:
+            errors.append(
+                f"第 {i} 行编号为 {num}，与导出版编号 {i} 不一致："
+                "离线校订不能修改编号或行序（身份按导出时编号绑定）"
+            )
+    if errors:
+        return None, errors
+
+    # 按导出时编号绑定身份：快照顺序第 i 个身份即导出编号 i 的条款
+    uploaded: dict[str, str] = {}
+    for i, _, body in parsed:
+        clause_id = snapshot_order[i - 1]
+        uploaded[clause_id] = MARKER_RE.sub(
+            lambda m: f"[[{snapshot_order[int(m.group(1)) - 1]}]]", body
+        )
+    return uploaded, []
+
+
+def _plan_offline_apply(
+    snapshot_order: list[str],
+    snapshot_by: dict[str, ClauseIn],
+    order_ids: list[str],
+    by_id: dict[str, ClauseIn],
+    uploaded: dict[str, str],
+) -> tuple[dict[str, str], list[dict]]:
+    """按当前稿核验离线回传，返回 改动身份 -> 新内部正文 与冲突列表。
+
+    仅处理相对快照正文有改动的行：
+    - 当前正文须仍等于快照正文（导出版，尚未做过任何校订），或已等于回传新正文
+      （该改动此前已接纳——幂等，不再处理）；
+    - 待改身份已删除、两边改成不同正文（当前既非快照值也非回传值）列为冲突；
+    - 改动行回传引用的目标身份已从当前稿删除（接纳会造成新失效引用）列为冲突；
+    - 其余未改行、当前顺序、基线与身份上界均不涉及。
+    """
+    changes: dict[str, str] = {}
+    conflicts: list[dict] = []
+
+    def add_conflict(clause_id: str, reason: str) -> None:
+        bucket = next((c for c in conflicts if c["id"] == clause_id), None)
+        if bucket is None:
+            bucket = {"id": clause_id, "original": int(clause_id[1:]), "reasons": []}
+            conflicts.append(bucket)
+        if reason not in bucket["reasons"]:
+            bucket["reasons"].append(reason)
+
+    for clause_id in snapshot_order:
+        snap_body = snapshot_by[clause_id].body
+        new_body = uploaded[clause_id]
+        if new_body == snap_body:
+            continue  # 回传未改动该行：与当前稿无关
+        if clause_id not in by_id:
+            add_conflict(clause_id, "待改身份已在当前草稿中删除，无法接回离线校订")
+            continue
+        cur_body = by_id[clause_id].body
+        if cur_body == new_body:
+            continue  # 该改动此前已接纳：幂等，不再处理
+        if cur_body != snap_body:
+            add_conflict(
+                clause_id,
+                "两边改成不同正文：当前正文既不等于导出版快照、也不等于回传正文"
+                "（导出版校订之后草稿又被改过），整份回传拒绝",
+            )
+            continue
+        for m in MARKER_RE.finditer(new_body):
+            if m.group(1) not in by_id:
+                add_conflict(
+                    clause_id,
+                    f"回传正文引用的目标 {m.group(1)}（原第 {m.group(1)[1:]} 条）"
+                    "已在当前草稿中删除，接纳将产生新的失效引用，整份回传拒绝",
+                )
+        changes[clause_id] = new_body
+
+    return changes, conflicts
+
+
+def _raise_offline_conflicts(conflicts: list[dict], order_ids: list[str]) -> None:
+    """离线回传语义冲突整份拒绝（409）：按给定顺序列出冲突身份与原因。"""
+    rank = {clause_id: i for i, clause_id in enumerate(order_ids)}
+    conflicts.sort(key=lambda c: rank.get(c["id"], len(rank)))
+    lines = ["离线校订与当前草稿冲突，整份拒绝，冲突如下："]
+    for c in conflicts:
+        for reason in c["reasons"]:
+            lines.append(f"身份 {c['id']}（原第 {c['original']} 条）：{reason}")
+    raise HTTPException(409, detail={"errors": lines, "conflicts": conflicts})
+
+
+def _offline_change_items(
+    snapshot_order: list[str],
+    snapshot_by: dict[str, ClauseIn],
+    order_ids: list[str],
+    by_id: dict[str, ClauseIn],
+    uploaded: dict[str, str],
+    changes: dict[str, str],
+) -> list[dict]:
+    """按快照导出顺序构造改动明细（预演展示与提交回执共用）。
+
+    ``changes`` 只含当前正文仍等于快照值、待接纳的行；当前已等于回传值（此前已接纳，
+    幂等）的行同样在回传中与快照不同，标记为 ``applied`` 一并展示，便于核对“哪些改动
+    已在稿上”。待改身份已删除属冲突（409），不进本明细。
+    """
+    snap_pos = {clause_id: i + 1 for i, clause_id in enumerate(snapshot_order)}
+    cur_pos = {clause_id: i + 1 for i, clause_id in enumerate(order_ids)}
+    items: list[dict] = []
+    for clause_id in snapshot_order:
+        new_body = uploaded[clause_id]
+        snap_body = snapshot_by[clause_id].body
+        if new_body == snap_body or clause_id not in by_id:
+            continue
+        cur_body = by_id[clause_id].body
+        status = "changed" if clause_id in changes else "applied"
+        items.append(
+            {
+                "id": clause_id,
+                "original": int(clause_id[1:]),
+                "export_no": snap_pos[clause_id],
+                "current_no": cur_pos.get(clause_id),
+                "status": status,  # changed：本次将接回；applied：当前已等于回传值（幂等）
+                "old_body": snap_body,
+                "new_body": new_body,
+                "current_body": cur_body,
+            }
+        )
+    return items
+
+
+def _offline_result(
+    order_ids: list[str],
+    by_id: dict[str, ClauseIn],
+    changes: dict[str, str],
+) -> tuple[list[str], list[dict]]:
+    """把接纳的改动写在当前稿副本上（只改正文，顺序与身份集合不变）。"""
+    new_clauses = [
+        {"id": clause_id, "body": changes.get(clause_id, by_id[clause_id].body)}
+        for clause_id in order_ids
+    ]
+    return list(order_ids), new_clauses
+
+
+def _offline_run(payload: OfflineIn) -> dict:
+    """离线回传预演 / 提交共用核验，返回改动明细与拟接纳（或已接纳）的结果草稿。"""
+    # 当前稿
+    by_id = _validate_state(payload.order_ids, payload.clauses)
+    lock_ids = _normalize_lock_ids(payload.lock_ids, by_id)
+    # 导出快照：结构沿用草稿校验（内部形态合法、顺序与条款集合一致）
+    snapshot_by = _validate_state(payload.snapshot.order_ids, payload.snapshot.clauses)
+    # 导出当刻不存在失效引用：快照内每个引用目标都须在快照顺序中
+    # （快照来自整稿导出，导出含失效引用会被拒绝；这里防构造/损坏的快照）
+    snap_errors: list[str] = []
+    for clause in payload.snapshot.clauses:
+        for m in MARKER_RE.finditer(clause.body):
+            if m.group(1) not in snapshot_by:
+                snap_errors.append(
+                    f"导出快照中 {clause.id} 的引用 [[{m.group(1)}]] 在导出时已无目标"
+                    "（快照只能来自无失效引用的整稿导出）"
+                )
+    if snap_errors:
+        raise HTTPException(422, detail={"errors": snap_errors})
+
+    # 回传文本：行数 / 编号 / 行序与快照一致，引用按导出时编号绑定身份
+    uploaded, parse_errors = _parse_offline_text(payload.text, payload.snapshot.order_ids)
+    if parse_errors:
+        raise HTTPException(422, detail={"errors": parse_errors})
+
+    # 按当前稿核验，仅处理相对快照改动的行
+    changes, conflicts = _plan_offline_apply(
+        payload.snapshot.order_ids, snapshot_by, payload.order_ids, by_id, uploaded
+    )
+
+    # 在拟接纳结果上按**最新锁定集合**核验（只改正文，顺序与身份集合不变）：
+    # 改动锁定条款正文即违例；未改行原样保留。回传引用的目标存续已在冲突阶段核验。
+    new_order, new_clauses = _offline_result(payload.order_ids, by_id, changes)
+    violations: list[dict] = []
+    if lock_ids is not None and changes:
+        new_by = {item["id"]: ClauseIn(**item) for item in new_clauses}
+        violations = _lock_violations(by_id, new_order, new_by, lock_ids)
+
+    if conflicts:
+        _raise_offline_conflicts(conflicts, payload.snapshot.order_ids)
+    if violations:
+        _raise_lock_violations(violations)
+
+    items = _offline_change_items(
+        payload.snapshot.order_ids, snapshot_by, payload.order_ids, by_id, uploaded, changes
+    )
+    return {
+        "changes": items,
+        "change_count": len(changes),
+        "order_ids": new_order,
+        "clauses": new_clauses,
+    }
+
+
+@app.post("/api/offline/preview")
+def offline_preview(payload: OfflineIn):
+    """离线校订预演：只展示相对快照的改动与拟接纳结果，不改动任何草稿。
+
+    冲突（待改身份删除、两边改成不同正文、回传引用目标已删除、锁定违例）返回 409；
+    快照 / 当前稿 / 回传文本结构非法返回 422。
+    """
+    result = _offline_run(payload)
+    return {
+        "changes": result["changes"],
+        "change_count": result["change_count"],
+        "order_ids": result["order_ids"],
+        "clauses": result["clauses"],
+    }
+
+
+@app.post("/api/offline/commit")
+def offline_commit(payload: OfflineIn):
+    """离线校订提交：按当前稿核验通过后返回接纳结果（只改相对快照改动的正文）。
+
+    服务端不持有草稿，结果由调用方按写稿提交协调层安装；核验规则与状态码同预演。
+    未改行、当前顺序、原稿基线与身份上界保持不变；冲突或锁定违例时整份拒绝。
+    """
+    result = _offline_run(payload)
+    return {
+        "changes": result["changes"],
+        "change_count": result["change_count"],
+        "order_ids": result["order_ids"],
+        "clauses": result["clauses"],
+    }
 
 
 # --------------------------------------------------------------------------- #

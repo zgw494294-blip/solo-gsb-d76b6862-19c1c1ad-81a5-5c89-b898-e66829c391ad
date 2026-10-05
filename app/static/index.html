@@ -92,6 +92,29 @@
         <div id="excerpt-body"></div>
       </section>
 
+      <!-- 离线校订回传：最近一次导出快照（仅存本页）+ 回传文本，预演后提交 -->
+      <section id="offline-panel" class="panel offline-panel">
+        <div class="offline-head">
+          <h2>离线校订回传</h2>
+          <div class="offline-status" id="offline-status"></div>
+        </div>
+        <p class="hint">
+          先点工具栏「下载纯文本」得到“编号|正文”校订文本（含失效引用时不能导出）；下载同时会在本页留存
+          <b>最近一次导出快照</b>。把离线改好的文本粘贴到下方，点「预演改动」先查看差异，确认后点「确认提交」。
+          回传文本<b>只许改正文</b>：行数、编号、行序必须与导出时一致；引用按<b>导出时编号</b>绑定身份，
+          不按当前编号解释。继续改稿不会清空快照；<b>重新导入、恢复存档或刷新页面后清空</b>。
+          提交按当前稿重新核验，仅接回相对快照改动的行；待改身份已删除、两边改成不同正文、
+          改动行引用目标已删除或违反锁定保护时<b>整份拒绝并列原因</b>，取消或失败一律不改稿。
+        </p>
+        <div id="offline-banner" class="banner" hidden></div>
+        <textarea id="offline-text" rows="8" placeholder="粘贴离线校订后的“编号|正文”文本（行数、编号、行序与导出时一致）"></textarea>
+        <div class="editor-actions">
+          <button type="button" id="offline-preview-btn" disabled>预演改动</button>
+          <button type="button" class="primary" id="offline-commit-btn" disabled>确认提交</button>
+        </div>
+        <div id="offline-body"></div>
+      </section>
+
       <!-- 合并记录：每次成功合并留一条撤销记录（仅存本页内存），可撤回到当前草稿 -->
       <section id="merge-panel" class="panel merge-panel">
         <div class="merge-head">
